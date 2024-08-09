@@ -70,7 +70,7 @@
 
 	yy::parser::symbol_type yylex(); // Provided by lexer.cpp
 
-	static uint32_t str2int2(std::vector<uint8_t> const &s);
+	static uint32_t strToNum(std::vector<int32_t> const &s);
 	static void errorInvalidUTF8Byte(uint8_t byte, char const *functionName);
 	static size_t strlenUTF8(std::string const &str);
 	static std::string strsubUTF8(std::string const &str, uint32_t pos, uint32_t len);
@@ -105,7 +105,6 @@
 %type <Expression> relocexpr_no_str
 %type <int32_t> const
 %type <int32_t> const_no_str
-%type <int32_t> const_8bit
 %type <int32_t> uconst
 %type <int32_t> rs_uconst
 %type <int32_t> shift_const
@@ -175,6 +174,8 @@
 %type <int32_t> opt_q_arg
 
 %token OP_HIGH "HIGH" OP_LOW "LOW"
+%token OP_BITWIDTH "BITWIDTH"
+%token OP_TZCOUNT "TZCOUNT"
 %token OP_ISCONST "ISCONST"
 
 %token OP_STRCMP "STRCMP"
@@ -264,6 +265,7 @@
 
 %type <std::vector<Expression>> ds_args
 %type <std::vector<std::string>> purge_args
+%type <std::vector<int32_t>> charmap_args
 %type <ForArgs> for_args
 
 %token Z80_ADC "adc" Z80_ADD "add" Z80_AND "and"
@@ -1083,8 +1085,18 @@ incbin:
 ;
 
 charmap:
-	POP_CHARMAP string COMMA const_8bit {
-		charmap_Add($2, (uint8_t)$4);
+	POP_CHARMAP string COMMA charmap_args trailing_comma {
+		charmap_Add($2, std::move($4));
+	}
+;
+
+charmap_args:
+	const {
+		$$.push_back(std::move($1));
+	}
+	| charmap_args COMMA const {
+		$$ = std::move($1);
+		$$.push_back(std::move($3));
 	}
 ;
 
@@ -1170,7 +1182,7 @@ constlist_8bit_entry:
 		sect_RelByte($1, 0);
 	}
 	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
+		std::vector<int32_t> output = charmap_Convert($1);
 		sect_AbsByteString(output);
 	}
 ;
@@ -1185,7 +1197,7 @@ constlist_16bit_entry:
 		sect_RelWord($1, 0);
 	}
 	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
+		std::vector<int32_t> output = charmap_Convert($1);
 		sect_AbsWordString(output);
 	}
 ;
@@ -1200,7 +1212,7 @@ constlist_32bit_entry:
 		sect_RelLong($1, 0);
 	}
 	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
+		std::vector<int32_t> output = charmap_Convert($1);
 		sect_AbsLongString(output);
 	}
 ;
@@ -1225,8 +1237,7 @@ reloc_8bit_offset:
 		$$.checkNBit(8);
 	}
 	| OP_SUB relocexpr {
-		$$ = std::move($2);
-		$$.makeNeg();
+		$$.makeUnaryOp(RPN_NEG, std::move($2));
 		$$.checkNBit(8);
 	}
 ;
@@ -1250,8 +1261,8 @@ relocexpr:
 		$$ = std::move($1);
 	}
 	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
-		$$.makeNumber(str2int2(output));
+		std::vector<int32_t> output = charmap_Convert($1);
+		$$.makeNumber(strToNum(output));
 	}
 ;
 
@@ -1263,8 +1274,7 @@ relocexpr_no_str:
 		$$.makeNumber($1);
 	}
 	| OP_LOGICNOT relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeLogicNot();
+		$$.makeUnaryOp(RPN_LOGNOT, std::move($2));
 	}
 	| relocexpr OP_LOGICOR relocexpr {
 		$$.makeBinaryOp(RPN_LOGOR, std::move($1), $3);
@@ -1330,20 +1340,22 @@ relocexpr_no_str:
 		$$ = std::move($2);
 	}
 	| OP_SUB relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeNeg();
+		$$.makeUnaryOp(RPN_NEG, std::move($2));
 	}
 	| OP_NOT relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeNot();
+		$$.makeUnaryOp(RPN_NOT, std::move($2));
 	}
 	| OP_HIGH LPAREN relocexpr RPAREN {
-		$$ = std::move($3);
-		$$.makeHigh();
+		$$.makeUnaryOp(RPN_HIGH, std::move($3));
 	}
 	| OP_LOW LPAREN relocexpr RPAREN {
-		$$ = std::move($3);
-		$$.makeLow();
+		$$.makeUnaryOp(RPN_LOW, std::move($3));
+	}
+	| OP_BITWIDTH LPAREN relocexpr RPAREN {
+		$$.makeUnaryOp(RPN_BITWIDTH, std::move($3));
+	}
+	| OP_TZCOUNT LPAREN relocexpr RPAREN {
+		$$.makeUnaryOp(RPN_TZCOUNT, std::move($3));
 	}
 	| OP_ISCONST LPAREN relocexpr RPAREN {
 		$$.makeNumber($3.isKnown());
@@ -1465,12 +1477,6 @@ const_no_str:
 	}
 ;
 
-const_8bit:
-	reloc_8bit {
-		$$ = $1.getConstVal();
-	}
-;
-
 opt_q_arg:
 	%empty {
 		$$ = fix_Precision();
@@ -1529,8 +1535,12 @@ string:
 	| POP_SECTION LPAREN scoped_anon_id RPAREN {
 		Symbol *sym = sym_FindScopedValidSymbol($3);
 
-		if (!sym)
-			fatalerror("Unknown symbol \"%s\"\n", $3.c_str());
+		if (!sym) {
+			if (sym_IsPurgedScoped($3))
+				fatalerror("Unknown symbol \"%s\"; it was purged\n", $3.c_str());
+			else
+				fatalerror("Unknown symbol \"%s\"\n", $3.c_str());
+		}
 		Section const *section = sym->getSection();
 
 		if (!section)
@@ -2374,26 +2384,27 @@ void yy::parser::error(std::string const &str) {
 	::error("%s\n", str.c_str());
 }
 
-static uint32_t str2int2(std::vector<uint8_t> const &s) {
+static uint32_t strToNum(std::vector<int32_t> const &s) {
 	uint32_t length = s.size();
 
-	if (length > 4)
-		warning(
-		    WARNING_NUMERIC_STRING_1,
-		    "Treating string as a number ignores first %" PRIu32 " character%s\n",
-		    length - 4,
-		    length == 5 ? "" : "s"
-		);
-	else if (length > 1)
-		warning(
-		    WARNING_NUMERIC_STRING_2, "Treating %" PRIu32 "-character string as a number\n", length
-		);
+	if (length == 1) {
+		// The string is a single character with a single value,
+		// which can be used directly as a number.
+		return (uint32_t)s[0];
+	}
+
+	warning(WARNING_OBSOLETE, "Treating multi-unit strings as numbers is deprecated\n");
+
+	for (int32_t v : s) {
+		if (!checkNBit(v, 8, "All character units"))
+			break;
+	}
 
 	uint32_t r = 0;
 
 	for (uint32_t i = length < 4 ? 0 : length - 4; i < length; i++) {
 		r <<= 8;
-		r |= s[i];
+		r |= static_cast<uint8_t>(s[i]);
 	}
 
 	return r;

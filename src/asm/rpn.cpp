@@ -9,7 +9,7 @@
 #include <string.h>
 #include <string_view>
 
-#include "helpers.hpp" // assume
+#include "helpers.hpp" // assume, clz, ctz
 #include "opmath.hpp"
 
 #include "asm/output.hpp"
@@ -82,6 +82,8 @@ void Expression::makeSymbol(std::string const &symName) {
 		isSymbol = true;
 
 		data = sym_IsPC(sym) ? "PC is not constant at assembly time"
+		                     : sym_IsPurgedScoped(symName)
+		                     ? "'"s + symName + "' is not constant at assembly time; it was purged"
 		                     : "'"s + symName + "' is not constant at assembly time";
 		sym = sym_Ref(symName);
 
@@ -122,7 +124,9 @@ void Expression::makeBankSymbol(std::string const &symName) {
 			// Symbol's section is known and bank is fixed
 			data = (int32_t)sym->getSection()->bank;
 		} else {
-			data = "\""s + symName + "\"'s bank is not known";
+			data = sym_IsPurgedScoped(symName)
+			     ? "\""s + symName + "\"'s bank is not known; it was purged"
+			     : "\""s + symName + "\"'s bank is not known";
 
 			size_t nameLen = sym->name.length() + 1; // Room for NUL!
 
@@ -207,12 +211,57 @@ static bool tryConstNonzero(Expression const &lhs, Expression const &rhs) {
 	return expr.isKnown() && expr.value() != 0;
 }
 
+static bool tryConstLogNot(Expression const &expr) {
+	Symbol const *sym = expr.symbolOf();
+	if (!sym || !sym->getSection() || !sym->isDefined())
+		return false;
+
+	assume(sym->isNumeric());
+
+	Section const &sect = *sym->getSection();
+	int32_t unknownBits = (1 << 16) - (1 << sect.align);
+
+	// `sym->getValue()` attempts to add the section's address, but that's "-1"
+	// because the section is floating (otherwise we wouldn't be here)
+	assume(sect.org == (uint32_t)-1);
+	int32_t symbolOfs = sym->getValue() + 1;
+
+	int32_t knownBits = (symbolOfs + sect.alignOfs) & ~unknownBits;
+	return knownBits != 0;
+}
+
 /*
- * Attempts to compute a constant binary AND from non-constant operands
+ * Attempts to compute a constant LOW() from non-constant argument
+ * This is possible if the argument is a symbol belonging to an `ALIGN[8]` section.
+ *
+ * @return The constant `LOW(expr)` result if it can be computed, or -1 otherwise.
+ */
+static int32_t tryConstLow(Expression const &expr) {
+	Symbol const *sym = expr.symbolOf();
+	if (!sym || !sym->getSection() || !sym->isDefined())
+		return -1;
+
+	assume(sym->isNumeric());
+
+	// The low byte must not cover any unknown bits
+	Section const &sect = *sym->getSection();
+	if (sect.align < 8)
+		return -1;
+
+	// `sym->getValue()` attempts to add the section's address, but that's "-1"
+	// because the section is floating (otherwise we wouldn't be here)
+	assume(sect.org == (uint32_t)-1);
+	int32_t symbolOfs = sym->getValue() + 1;
+
+	return (symbolOfs + sect.alignOfs) & 0xFF;
+}
+
+/*
+ * Attempts to compute a constant binary AND with one non-constant operands
  * This is possible if one operand is a symbol belonging to an `ALIGN[N]` section, and the other is
  * a constant that only keeps (some of) the lower N bits.
  *
- * @return The constant result if it can be computed, or -1 otherwise.
+ * @return The constant `lhs & rhs` result if it can be computed, or -1 otherwise.
  */
 static int32_t tryConstMask(Expression const &lhs, Expression const &rhs) {
 	Symbol const *lhsSymbol = lhs.symbolOf();
@@ -227,16 +276,17 @@ static int32_t tryConstMask(Expression const &lhs, Expression const &rhs) {
 	Symbol const &sym = lhsIsSymbol ? *lhsSymbol : *rhsSymbol;
 	Expression const &expr = lhsIsSymbol ? rhs : lhs; // Opposite side of `sym`
 
+	if (!sym.isDefined() || !expr.isKnown())
+		return -1;
+
 	assume(sym.isNumeric());
 
-	if (!expr.isKnown())
-		return -1;
 	// We can now safely use `expr.value()`
-	Section const &sect = *sym.getSection();
-	int32_t unknownBits = (1 << 16) - (1 << sect.align); // The max alignment is 16
+	int32_t mask = expr.value();
 
-	// The mask must ignore all unknown bits
-	if ((expr.value() & unknownBits) != 0)
+	// The mask must not cover any unknown bits
+	Section const &sect = *sym.getSection();
+	if (int32_t unknownBits = (1 << 16) - (1 << sect.align); (unknownBits & mask) != 0)
 		return -1;
 
 	// `sym.getValue()` attempts to add the section's address, but that's "-1"
@@ -244,61 +294,88 @@ static int32_t tryConstMask(Expression const &lhs, Expression const &rhs) {
 	assume(sect.org == (uint32_t)-1);
 	int32_t symbolOfs = sym.getValue() + 1;
 
-	return (symbolOfs + sect.alignOfs) & ~unknownBits;
+	return (symbolOfs + sect.alignOfs) & mask;
 }
 
-void Expression::makeHigh() {
-	isSymbol = false;
-	if (isKnown()) {
-		data = (int32_t)((uint32_t)value() >> 8 & 0xFF);
+void Expression::makeUnaryOp(RPNCommand op, Expression &&src) {
+	clear();
+	// First, check if the expression is known
+	if (src.isKnown()) {
+		// If the expressions is known, just compute the value
+		int32_t val = src.value();
+
+		switch (op) {
+		case RPN_NEG:
+			data = (int32_t) - (uint32_t)val;
+			break;
+		case RPN_NOT:
+			data = ~val;
+			break;
+		case RPN_LOGNOT:
+			data = !val;
+			break;
+		case RPN_HIGH:
+			data = (int32_t)((uint32_t)val >> 8 & 0xFF);
+			break;
+		case RPN_LOW:
+			data = val & 0xFF;
+			break;
+		case RPN_BITWIDTH:
+			data = val != 0 ? 32 - clz((uint32_t)val) : 0;
+			break;
+		case RPN_TZCOUNT:
+			data = val != 0 ? ctz((uint32_t)val) : 32;
+			break;
+
+		case RPN_LOGOR:
+		case RPN_LOGAND:
+		case RPN_LOGEQ:
+		case RPN_LOGGT:
+		case RPN_LOGLT:
+		case RPN_LOGGE:
+		case RPN_LOGLE:
+		case RPN_LOGNE:
+		case RPN_ADD:
+		case RPN_SUB:
+		case RPN_XOR:
+		case RPN_OR:
+		case RPN_AND:
+		case RPN_SHL:
+		case RPN_SHR:
+		case RPN_USHR:
+		case RPN_MUL:
+		case RPN_DIV:
+		case RPN_MOD:
+		case RPN_EXP:
+		case RPN_BANK_SYM:
+		case RPN_BANK_SECT:
+		case RPN_BANK_SELF:
+		case RPN_SIZEOF_SECT:
+		case RPN_STARTOF_SECT:
+		case RPN_SIZEOF_SECTTYPE:
+		case RPN_STARTOF_SECTTYPE:
+		case RPN_HRAM:
+		case RPN_RST:
+		case RPN_CONST:
+		case RPN_SYM:
+			fatalerror("%d is not an unary operator\n", op);
+		}
+	} else if (op == RPN_LOGNOT && tryConstLogNot(src)) {
+		data = 0;
+	} else if (int32_t constVal; op == RPN_LOW && (constVal = tryConstLow(src)) != -1) {
+		data = constVal;
 	} else {
-		uint8_t bytes[] = {RPN_CONST, 8, 0, 0, 0, RPN_SHR, RPN_CONST, 0xFF, 0, 0, 0, RPN_AND};
-
-		memcpy(reserveSpace(sizeof(bytes)), bytes, sizeof(bytes));
-	}
-}
-
-void Expression::makeLow() {
-	isSymbol = false;
-	if (isKnown()) {
-		data = value() & 0xFF;
-	} else {
-		uint8_t bytes[] = {RPN_CONST, 0xFF, 0, 0, 0, RPN_AND};
-
-		memcpy(reserveSpace(sizeof(bytes)), bytes, sizeof(bytes));
-	}
-}
-
-void Expression::makeNeg() {
-	isSymbol = false;
-	if (isKnown()) {
-		data = (int32_t) - (uint32_t)value();
-	} else {
-		*reserveSpace(1) = RPN_NEG;
-	}
-}
-
-void Expression::makeNot() {
-	isSymbol = false;
-	if (isKnown()) {
-		data = ~value();
-	} else {
-		*reserveSpace(1) = RPN_NOT;
-	}
-}
-
-void Expression::makeLogicNot() {
-	isSymbol = false;
-	if (isKnown()) {
-		data = !value();
-	} else {
-		*reserveSpace(1) = RPN_LOGNOT;
+		// If it's not known, just reuse its RPN buffer and append the operator
+		rpnPatchSize = src.rpnPatchSize;
+		std::swap(rpn, src.rpn);
+		data = std::move(src.data);
+		*reserveSpace(1) = op;
 	}
 }
 
 void Expression::makeBinaryOp(RPNCommand op, Expression &&src1, Expression const &src2) {
 	clear();
-	// First, check if the expression is known
+	// First, check if the expressions are known
 	if (src1.isKnown() && src2.isKnown()) {
 		// If both expressions are known, just compute the value
 		int32_t lval = src1.value(), rval = src2.value();
@@ -426,6 +503,10 @@ void Expression::makeBinaryOp(RPNCommand op, Expression &&src1, Expression const
 		case RPN_STARTOF_SECTTYPE:
 		case RPN_HRAM:
 		case RPN_RST:
+		case RPN_HIGH:
+		case RPN_LOW:
+		case RPN_BITWIDTH:
+		case RPN_TZCOUNT:
 		case RPN_CONST:
 		case RPN_SYM:
 			fatalerror("%d is not a binary operator\n", op);
@@ -516,13 +597,22 @@ void Expression::makeCheckRST() {
 
 // Checks that an RPN expression's value fits within N bits (signed or unsigned)
 void Expression::checkNBit(uint8_t n) const {
+	if (isKnown())
+		::checkNBit(value(), n, "Expression");
+}
+
+bool checkNBit(int32_t v, uint8_t n, char const *name) {
 	assume(n != 0);                     // That doesn't make sense
 	assume(n < CHAR_BIT * sizeof(int)); // Otherwise `1 << n` is UB
 
-	if (isKnown()) {
-		if (int32_t val = value(); val < -(1 << n) || val >= 1 << n)
-			warning(WARNING_TRUNCATION_1, "Expression must be %u-bit\n", n);
-		else if (val < -(1 << (n - 1)))
-			warning(WARNING_TRUNCATION_2, "Expression must be %u-bit\n", n);
+	if (v < -(1 << n) || v >= 1 << n) {
+		warning(WARNING_TRUNCATION_1, "%s must be %u-bit\n", name, n);
+		return false;
 	}
+	if (v < -(1 << (n - 1))) {
+		warning(WARNING_TRUNCATION_2, "%s must be %u-bit\n", name, n);
+		return false;
+	}
+
+	return true;
 }

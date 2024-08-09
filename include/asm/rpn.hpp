@@ -45,11 +45,7 @@ struct Expression {
 	void makeStartOfSection(std::string const &sectName);
 	void makeSizeOfSectionType(SectionType type);
 	void makeStartOfSectionType(SectionType type);
-	void makeHigh();
-	void makeLow();
-	void makeNeg();
-	void makeNot();
-	void makeLogicNot();
+	void makeUnaryOp(RPNCommand op, Expression &&src);
 	void makeBinaryOp(RPNCommand op, Expression &&src1, Expression const &src2);
 
 	void makeCheckHRAM();
@@ -62,5 +58,7 @@ private:
 	uint8_t *reserveSpace(uint32_t size);
 	uint8_t *reserveSpace(uint32_t size, uint32_t patchSize);
 };
+
+bool checkNBit(int32_t v, uint8_t n, char const *name);
 
 #endif // RGBDS_ASM_RPN_HPP

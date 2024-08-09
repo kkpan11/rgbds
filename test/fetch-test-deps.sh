@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
@@ -52,7 +52,10 @@ case "$actionname" in
 			# libbet depends on PIL to build
 			if [ "$2" = "libbet" ]; then
 				case "${osname%-*}" in
-					ubuntu|macos)
+					macos)
+						python3 -m pip install --break-system-packages pillow
+						;;
+					ubuntu)
 						python3 -m pip install pillow
 						;;
 					windows)
@@ -95,10 +98,10 @@ case "$actionname" in
 esac
 
 if "$nonfree"; then
-	action pret  pokecrystal      2024-03-03 c1da20e2f12f95c935500151d15f455e7e7eb213
-	action pret  pokered          2024-01-02 fabe2b3fb3fb5a849c5220298acabbdc9ad30f3b
-	action zladx LADX-Disassembly 2024-02-25 583c78d2f2a5258b87bf133f75b7129228255650
+	action pret  pokecrystal      2024-08-03 746a06f1de77dd6ffdba76ea33bb0181773326b6
+	action pret  pokered          2024-08-03 59202a2ab5f097262db25eb9b12c41d2389c5164
+	action zladx LADX-Disassembly 2024-07-31 3283fd6bf899eec9d307ac3a495a01c45f24ceec
 fi
-action AntonioND ucity   2024-03-28 e9550498415642e06bc5db77fe824c1bd22c8ad9
-action pinobatch libbet  2024-03-28 a3e5770f5904fe02a55c6651dd674896f101d6d1
-action LIJI32    SameBoy 2024-03-08 e7792c16b24c08f55a370973f0beaecb7bd0ab92
+action AntonioND ucity   2024-08-03 f3c6377f1fb1ea29644bcd90722abaaa5d478a74
+action pinobatch libbet  2024-06-15 ee60f0e4712a938589edd3e5d258e519a475d754
+action LIJI32    SameBoy 2024-08-01 47cdefd3d022b31d984ede91cd0f6965ff88d065

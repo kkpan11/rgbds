@@ -22,6 +22,11 @@ Label const &Symbol::label() const {
 	return std::get<Label>(data);
 }
 
+void sym_ForEach(void (*callback)(Symbol &)) {
+	for (auto &it : symbols)
+		callback(*it.second);
+}
+
 void sym_AddSymbol(Symbol &symbol) {
 	Symbol *other = sym_GetSymbol(symbol.name);
 	auto *symValue = std::get_if<int32_t>(&symbol.data);
@@ -33,7 +38,7 @@ void sym_AddSymbol(Symbol &symbol) {
 		symbol.src->dump(symbol.lineNo);
 		fprintf(stderr, " and in %s from ", other->objFileName);
 		other->src->dump(other->lineNo);
-		fputc('\n', stderr);
+		putc('\n', stderr);
 		exit(1);
 	}
 

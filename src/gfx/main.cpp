@@ -36,6 +36,7 @@ static struct LocalOptions {
 	bool autoPalettes;
 	bool autoPalmap;
 	bool groupOutputs;
+	bool reverse;
 } localOptions;
 
 static uintmax_t nbErrors;
@@ -43,6 +44,12 @@ static uintmax_t nbErrors;
 [[noreturn]] void giveUp() {
 	fprintf(stderr, "Conversion aborted after %ju error%s\n", nbErrors, nbErrors == 1 ? "" : "s");
 	exit(1);
+}
+
+void requireZeroErrors() {
+	if (nbErrors != 0) {
+		giveUp();
+	}
 }
 
 void warning(char const *fmt, ...) {
@@ -535,12 +542,10 @@ static char *parseArgv(int argc, char *argv[]) {
 			options.palmap = musl_optarg;
 			break;
 		case 'r':
+			localOptions.reverse = true;
 			options.reversedWidth = parseNumber(arg, "Reversed image stride");
 			if (*arg != '\0') {
 				error("Reversed image stride (-r) must be a valid number, not \"%s\"", musl_optarg);
-			}
-			if (options.reversedWidth == 0) {
-				error("Reversed image stride (-r) may not be 0!");
 			}
 			break;
 		case 's':
@@ -589,7 +594,6 @@ static char *parseArgv(int argc, char *argv[]) {
 			}
 			break;
 		default:
-			fprintf(stderr, "FATAL: unknown option '%c'\n", ch);
 			printUsage();
 			exit(1);
 		}
@@ -762,7 +766,7 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "\tBit depth: %" PRIu8 "bpp\n", options.bitDepth);
 		if (options.trim != 0)
 			fprintf(stderr, "\tTrim the last %" PRIu64 " tiles\n", options.trim);
-		fprintf(stderr, "\tMaximum %" PRIu8 " palettes\n", options.nbPalettes);
+		fprintf(stderr, "\tMaximum %" PRIu16 " palettes\n", options.nbPalettes);
 		fprintf(stderr, "\tPalettes contain %" PRIu8 " colors\n", options.nbColorsPerPal);
 		fprintf(stderr, "\t%s palette spec\n", [] {
 			switch (options.palSpecType) {
@@ -786,7 +790,7 @@ int main(int argc, char *argv[]) {
 						fputs("#none, ", stderr);
 					}
 				}
-				fputc('\n', stderr);
+				putc('\n', stderr);
 			}
 			fputs("\t]\n", stderr);
 		}
@@ -824,18 +828,17 @@ int main(int argc, char *argv[]) {
 		fputs("Ready.\n", stderr);
 	}
 
-	// Do not do anything if option parsing went wrong
-	if (nbErrors) {
-		giveUp();
-	}
+	// Do not do anything if option parsing went wrong.
+	requireZeroErrors();
 
 	if (!options.input.empty()) {
-		if (options.reverse()) {
+		if (localOptions.reverse) {
 			reverse();
 		} else {
 			process();
 		}
-	} else if (!options.palettes.empty() && options.palSpecType == Options::EXPLICIT && !options.reverse()) {
+	} else if (!options.palettes.empty() && options.palSpecType == Options::EXPLICIT
+	           && !localOptions.reverse) {
 		processPalettes();
 	} else {
 		fputs("FATAL: No input image specified\n", stderr);
@@ -843,9 +846,7 @@ int main(int argc, char *argv[]) {
 		exit(1);
 	}
 
-	if (nbErrors) {
-		giveUp();
-	}
+	requireZeroErrors();
 	return 0;
 }
 

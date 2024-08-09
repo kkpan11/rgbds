@@ -176,7 +176,9 @@ void parseInlinePalSpec(char const * const rawArg) {
  * Returns whether the magic was correctly read.
  */
 template<size_t n>
-static bool readMagic(std::filebuf &file, char const *magic) {
+[[gnu::warn_unused_result]] // Ignoring failure to match is a bad idea.
+static bool
+    readMagic(std::filebuf &file, char const *magic) {
 	assume(strlen(magic) == n);
 
 	char magicBuf[n];
@@ -203,25 +205,37 @@ static T readLE(U const *bytes) {
 
 /*
  * **Appends** the first line read from `file` to the end of the provided `buffer`.
+ *
+ * @return true if a line was read.
  */
-static void readLine(std::filebuf &file, std::string &buffer) {
+[[gnu::warn_unused_result]] // Ignoring EOF is a bad idea.
+static bool
+    readLine(std::filebuf &file, std::string &buffer) {
 	// TODO: maybe this can be optimized to bulk reads?
 	for (;;) {
 		auto c = file.sbumpc();
 		if (c == std::filebuf::traits_type::eof()) {
-			return;
+			return false;
 		}
 		if (c == '\n') {
 			// Discard a trailing CRLF
 			if (!buffer.empty() && buffer.back() == '\r') {
 				buffer.pop_back();
 			}
-			return;
+			return true;
 		}
 
 		buffer.push_back(c);
 	}
 }
+
+#define requireLine(kind, file, buffer) \
+	do { \
+		if (!readLine(file, buffer)) { \
+			error(kind " palette file is shorter than expected"); \
+			return; \
+		} \
+	} while (0)
 
 /*
  * Parses the initial part of a string_view, advancing the "read index" as it does
@@ -229,11 +243,11 @@ static void readLine(std::filebuf &file, std::string &buffer) {
 template<typename U> // Should be uint*_t
 static std::optional<U> parseDec(std::string const &str, std::string::size_type &n) {
 	uintmax_t value = 0;
-	auto result = std::from_chars(str.data(), str.data() + str.size(), value);
-	if ((bool)result.ec) {
+	auto result = std::from_chars(str.data() + n, str.data() + str.size(), value);
+	if (static_cast<bool>(result.ec)) {
 		return std::nullopt;
 	}
-	n += result.ptr - str.data();
+	n = result.ptr - str.data();
 	return std::optional<U>{value};
 }
 
@@ -272,21 +286,20 @@ static void parsePSPFile(std::filebuf &file) {
 	// https://www.selapa.net/swatches/colors/fileformats.php#psp_pal
 
 	std::string line;
-	readLine(file, line);
-	if (line != "JASC-PAL") {
+	if (!readLine(file, line) || line != "JASC-PAL") {
 		error("Palette file does not appear to be a PSP palette file");
 		return;
 	}
 
 	line.clear();
-	readLine(file, line);
+	requireLine("PSP", file, line);
 	if (line != "0100") {
 		error("Unsupported PSP palette file version \"%s\"", line.c_str());
 		return;
 	}
 
 	line.clear();
-	readLine(file, line);
+	requireLine("PSP", file, line);
 	std::string::size_type n = 0;
 	std::optional<uint16_t> nbColors = parseDec<uint16_t>(line, n);
 	if (!nbColors || n != line.length()) {
@@ -309,7 +322,7 @@ static void parsePSPFile(std::filebuf &file) {
 
 	for (uint16_t i = 0; i < *nbColors; ++i) {
 		line.clear();
-		readLine(file, line);
+		requireLine("PSP", file, line);
 
 		n = 0;
 		std::optional<Rgba> color = parseColor(line, n, i + 1);
@@ -336,39 +349,45 @@ static void parseGPLFile(std::filebuf &file) {
 	// https://gitlab.gnome.org/GNOME/gimp/-/blob/gimp-2-10/app/core/gimppalette-load.c#L39
 
 	std::string line;
-	readLine(file, line);
-	if (!line.starts_with("GIMP Palette")) {
+	if (!readLine(file, line) || !line.starts_with("GIMP Palette")) {
 		error("Palette file does not appear to be a GPL palette file");
 		return;
 	}
 
 	uint16_t nbColors = 0;
-	uint16_t maxNbColors = options.nbColorsPerPal * options.nbPalettes;
+	uint16_t const maxNbColors = options.nbColorsPerPal * options.nbPalettes;
 
 	for (;;) {
 		line.clear();
-		readLine(file, line);
-		if (!line.length()) {
+		if (!readLine(file, line)) {
 			break;
 		}
-
-		if (line.starts_with("#") || line.starts_with("Name:") || line.starts_with("Column:")) {
+		if (line.starts_with("Name:") || line.starts_with("Columns:")) {
 			continue;
 		}
 
 		std::string::size_type n = 0;
+		skipWhitespace(line, n);
+		// Skip empty lines, or lines that contain just a comment.
+		if (line.length() == n || line[n] == '#') {
+			continue;
+		}
+
 		std::optional<Rgba> color = parseColor(line, n, nbColors + 1);
 		if (!color) {
 			return;
 		}
+		// Ignore anything following the three components
+		// (sometimes it's a comment, sometimes it's the color in CSS hex format, sometimes there's
+		// nothing...).
 
-		++nbColors;
 		if (nbColors < maxNbColors) {
-			if (nbColors % options.nbColorsPerPal == 1) {
+			if (nbColors % options.nbColorsPerPal == 0) {
 				options.palSpec.emplace_back();
 			}
 			options.palSpec.back()[nbColors % options.nbColorsPerPal] = *color;
 		}
+		++nbColors;
 	}
 
 	if (nbColors > maxNbColors) {
@@ -385,13 +404,16 @@ static void parseHEXFile(std::filebuf &file) {
 	// https://lospec.com/palette-list/tag/gbc
 
 	uint16_t nbColors = 0;
-	uint16_t maxNbColors = options.nbColorsPerPal * options.nbPalettes;
+	uint16_t const maxNbColors = options.nbColorsPerPal * options.nbPalettes;
 
 	for (;;) {
 		std::string line;
-		readLine(file, line);
-		if (!line.length()) {
+		if (!readLine(file, line)) {
 			break;
+		}
+		// Ignore empty lines.
+		if (line.length() == 0) {
+			continue;
 		}
 
 		if (line.length() != 6
@@ -407,13 +429,13 @@ static void parseHEXFile(std::filebuf &file) {
 		Rgba color =
 		    Rgba(toHex(line[0], line[1]), toHex(line[2], line[3]), toHex(line[4], line[5]), 0xFF);
 
-		++nbColors;
 		if (nbColors < maxNbColors) {
-			if (nbColors % options.nbColorsPerPal == 1) {
+			if (nbColors % options.nbColorsPerPal == 0) {
 				options.palSpec.emplace_back();
 			}
 			options.palSpec.back()[nbColors % options.nbColorsPerPal] = color;
 		}
+		++nbColors;
 	}
 
 	if (nbColors > maxNbColors) {

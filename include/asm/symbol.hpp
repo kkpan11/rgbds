@@ -44,7 +44,8 @@ struct Symbol {
 	    >
 	    data;
 
-	uint32_t ID; // ID of the symbol in the object file (-1 if none)
+	uint32_t ID;       // ID of the symbol in the object file (-1 if none)
+	uint32_t defIndex; // Ordering of the symbol in the state file
 
 	bool isDefined() const { return type != SYM_REF; }
 	bool isNumeric() const { return type == SYM_LABEL || type == SYM_EQU || type == SYM_VAR; }
@@ -67,7 +68,7 @@ struct Symbol {
 	uint32_t getConstantValue() const;
 };
 
-void sym_ForEach(void (*func)(Symbol &));
+void sym_ForEach(void (*callback)(Symbol &));
 
 void sym_SetExportAll(bool set);
 Symbol *sym_AddLocalLabel(std::string const &symName);
@@ -94,6 +95,8 @@ Symbol *sym_Ref(std::string const &symName);
 Symbol *sym_AddString(std::string const &symName, std::shared_ptr<std::string> value);
 Symbol *sym_RedefString(std::string const &symName, std::shared_ptr<std::string> value);
 void sym_Purge(std::string const &symName);
+bool sym_IsPurgedExact(std::string const &symName);
+bool sym_IsPurgedScoped(std::string const &symName);
 void sym_Init(time_t now);
 
 // Functions to save and restore the current symbol scope.

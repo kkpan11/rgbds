@@ -13,9 +13,6 @@
 #include "gfx/rgba.hpp"
 
 struct Options {
-	uint16_t reversedWidth = 0; // -r, in tiles
-	bool reverse() const { return reversedWidth != 0; }
-
 	bool useColorCurve = false;  // -C
 	bool allowMirroring = false; // -m
 	bool allowDedup = false;     // -u
@@ -38,10 +35,11 @@ struct Options {
 		uint16_t height;
 	} inputSlice{0, 0, 0, 0};                          // -L (margins in clockwise order, like CSS)
 	std::array<uint16_t, 2> maxNbTiles{UINT16_MAX, 0}; // -N
-	uint8_t nbPalettes = 8;                            // -n
+	uint16_t nbPalettes = 8;                           // -n
 	std::string output{};                              // -o
 	std::string palettes{};                            // -p, -P
 	std::string palmap{};                              // -q, -Q
+	uint16_t reversedWidth = 0;                        // -r, in tiles
 	uint8_t nbColorsPerPal = 0;                        // -s; 0 means "auto" = 1 << bitDepth;
 	std::string tilemap{};                             // -t, -T
 	uint64_t trim = 0;                                 // -x
@@ -67,6 +65,10 @@ extern Options options;
  * Prints the error count, and exits with failure
  */
 [[noreturn]] void giveUp();
+/*
+ * If any error has been emitted thus far, calls `giveUp()`.
+ */
+void requireZeroErrors();
 /*
  * Prints a warning, and does not change the error count
  */

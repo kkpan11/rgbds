@@ -2,16 +2,16 @@
 .\"
 .\" SPDX-License-Identifier: MIT
 .\"
-.Dd December 22, 2023
+.Dd August 6, 2024
 .Dt RGBASM 5
 .Os
 .Sh NAME
 .Nm rgbasm
 .Nd language documentation
 .Sh DESCRIPTION
-This is the full description of the language used by
+This is the full description of the assembly language used by
 .Xr rgbasm 1 .
-The description of the instructions supported by the Game Boy CPU is in
+For the full description of instructions in the machine language supported by the Game Boy CPU, see
 .Xr gbz80 7 .
 .Pp
 It is advisable to have some familiarity with the Game Boy hardware before reading this document.
@@ -46,6 +46,23 @@ They must come first in the line.
 Instructions are assembled into Game Boy opcodes.
 Multiple instructions on one line can be separated by double colons
 .Ql :: .
+.Pp
+The available instructions are documented in
+.Xr gbz80 7 .
+Note that where an instruction requires an 8-bit register
+.Ar r8 ,
+.Nm
+can interpret
+.Ic HIGH Ns Pq Ar r16
+as the top 8-bit register of the given
+.Ar r16 ,
+and
+.Ic LOW Ns Pq Ar r16
+as the bottom one (except for
+.Ic LOW Ns Pq Ic AF ,
+since
+.Ic F
+is not a valid register).
 .Pp
 All reserved keywords (directives, register names, etc.) are case-insensitive;
 all identifiers (labels and other symbol names) are case-sensitive.
@@ -280,20 +297,20 @@ A great number of operators you can use in expressions are available (listed fro
 .It Li \&! Ta Unary not
 .El
 .Pp
-.Ic ~
+.Sq ~
 complements a value by inverting all its bits.
 .Pp
-.Ic %
+.Sq %
 is used to get the remainder of the corresponding division, so that
-.Sq a / b * b + a % b == a
+.Ql x / y * y + x % y == x
 is always true.
 The result has the same sign as the divisor.
 This makes
-.Sq a % b .
+.Ql x % y
 equal to
-.Sq (a + b) % b
+.Ql (x + y) % y
 or
-.Sq (a - b) % b .
+.Ql (x - y) % y .
 .Pp
 Shifting works by shifting all bits in the left operand either left
 .Pq Sq <<
@@ -324,43 +341,73 @@ with a zero constant as either operand will be constant 0, and
 .Sq ||
 with a non-zero constant as either operand will be constant 1, even if the other operand is non-constant.
 .Pp
-.Ic \&!
+.Sq \&!
 returns 1 if the operand was 0, and 0 otherwise.
-.Ss Fixed-point expressions
-Fixed-point numbers are basically normal (32-bit) integers, which count fractions instead of whole numbers.
-They offer better precision than integers but limit the range of values.
-By default, the upper 16 bits are used for the integer part and the lower 16 bits are used for the fraction (65536ths).
-The default number of fractional bits can be changed with the
-.Fl Q
-command-line option.
-You can also specify a precise fixed-point value by appending a
-.Dq q
-to it followed by the number of fractional bits, such as
-.Ql 12.34q8 .
-.Pp
-Since fixed-point values are still just integers, you can use them in normal integer expressions.
-Some integer operators like
-.Sq +
-and
-.Sq -
-don't care whether the operands are integers or fixed-point.
-You can easily truncate a fixed-point number into an integer by shifting it right by 16 bits.
-It follows that you can convert an integer to a fixed-point number by shifting it left.
-.Pp
-The following functions are designed to operate with fixed-point numbers:
+Even a non-constant operand with any non-zero bits will return 0.
+.Ss Integer functions
+Besides operators, there are also some functions which have more specialized uses.
+.Bl -column "BITWIDTH(n)"
+.It Sy Name Ta Sy Operation
+.It Fn HIGH n Ta Equivalent to Ql Ar n No & $FF .
+.It Fn LOW n Ta Equivalent to Ql Po Ns Ar n No & $FF00 Pc >> 8 .
 .EQ
 delim $$
 .EN
+.It Fn BITWIDTH n Ta Returns the number of bits necessary to represent
+.Ar n .
+Some useful formulas:
+.Ic BITWIDTH Ns ( Ar n Ns )\ \-\ 1
+equals $\[lf] log sub 2 ( n ) \[rf]$,
+.Ic BITWIDTH Ns Pq Ar n Ns \ \-\ 1
+equals $\[lc] log sub 2 ( n ) \[rc]$, and
+.No 32\ \-\  Ns Ic BITWIDTH Ns Pq Ar n
+equals $roman clz ( n )$.
+.It Fn TZCOUNT n Ta Returns $roman ctz ( n )$, the count of trailing zero bits at the end of the binary representation of
+.Ar n .
+.El
+.EQ
+delim off
+.EN
+.Ss Fixed-point expressions
+Fixed-point numbers are technically just integers, but conceptually they have a decimal point at a fixed location (hence the name).
+This gives them increased precision, at the cost of a smaller range, while remaining far cheaper to manipulate than floating-point numbers (which
+.Nm
+does not support).
+.Pp
+The default precision of all fixed-point numbers is 16 bits, meaning the lower 16 bits are used for the fractional part; so they count in 65536ths of 1.0.
+This precision can be changed with the
+.Fl Q
+command-line option, and/or by
+.Ic OPT Q
+.Pq see Sx Changing options while assembling .
+An individual fixed-point literal can specify its own precision, overriding the current default, by appending a
+.Dq q
+followed by the number of fractional bits: for example,
+.Ql 1234.5q8
+is equal to $0004d2_80
+.EQ
+delim $$
+.EN
+($= 1234.5 * 2 sup 8$).
+.Pp
+Since fixed-point values are still just integers, you can use them in normal integer expressions.
+You can easily truncate a fixed-point number into an integer by shifting it right by the number of fractional bits.
+It follows that you can convert an integer to a fixed-point number by shifting it left that same amount.
+.Pp
+Note that the current number of fractional bits can be computed as
+.Ic TZCOUNT Ns Pq 1.0 .
+.Pp
+The following functions are designed to operate with fixed-point numbers:
 .Bl -column -offset indent "ATAN2(y, x)"
 .It Sy Name Ta Sy Operation
-.It Fn DIV x y Ta Fixed-point division $( x \[di] y ) \[mu] ( 2 ^ precision )$
-.It Fn MUL x y Ta Fixed-point multiplication $( x \[mu] y ) \[di] ( 2 ^ precision )$
-.It Fn FMOD x y Ta Fixed-point modulo $( x % y ) \[di] ( 2 ^ precision )$
-.It Fn POW x y Ta $x$ to the $y$ power
+.It Fn DIV x y Ta Fixed-point division
+.It Fn MUL x y Ta Fixed-point multiplication
+.It Fn FMOD x y Ta Fixed-point modulo
+.It Fn POW x y Ta $x sup y$
 .It Fn LOG x y Ta Logarithm of $x$ to the base $y$
 .It Fn ROUND x Ta Round $x$ to the nearest integer
-.It Fn CEIL x Ta Round $x$ up to an integer
-.It Fn FLOOR x Ta Round $x$ down to an integer
+.It Fn CEIL x Ta Round $x$ up to the nearest integer
+.It Fn FLOOR x Ta Round $x$ down to the nearest integer
 .It Fn SIN x Ta Sine of $x$
 .It Fn COS x Ta Cosine of $x$
 .It Fn TAN x Ta Tangent of $x$
@@ -373,7 +420,25 @@ delim $$
 delim off
 .EN
 .Pp
-All of these fixed-point functions can take an optional final argument, which is the precision to use.
+There are no functions for fixed-point addition and subtraction, because the
+.Sq +
+and
+.Sq -
+operators can add and subtract pairs of fixed-point operands.
+.Bd -ragged -offset indent
+Note that some operators or functions are meaningful when combining integers and fixed-point values.
+For example,
+.Ql 2.0 * 3
+is equivalent to
+.Ql MUL(2.0, 3.0) ,
+and
+.Ql 6.0 / 2
+is equivalent to
+.Ql DIV(6.0, 2.0) .
+Be careful and think about what the operations mean when doing this sort of thing.
+.Ed
+.Pp
+All of these fixed-point functions can take an optional final argument, which is the precision to use for that one operation.
 For example,
 .Ql MUL(6.0q8, 7.0q8, 8)
 will evaluate to
@@ -381,22 +446,45 @@ will evaluate to
 no matter what value is set as the current
 .Cm Q
 option.
+.Nm
+.Em does not check precisions for consistency ,
+so nonsensical input like
+.Ql MUL(4.2q8, 6.9q12, 16)
+will produce a nonsensical (but technically correct) result:
+.Dq garbage in, garbage out .
 .Pp
-The trigonometry functions (
-.Ic SIN ,
-.Ic COS ,
-.Ic TAN ,
-etc) are defined in terms of a circle divided into 1.0 "turns" (equal to 2pi radians or 360 degrees).
+The
+.Ic FMOD
+function
+is used to get the remainder of the corresponding fixed-point division, so that
+.Ql MUL(DIV(x, y), y) + FMOD(x, y) == x
+is always true.
+The result has the same sign as the
+.Em dividend ;
+this is the opposite of how the integer modulo operator
+.Sq %
+works!
+.Pp
+The trigonometry functions
+.Pq Ic SIN , Ic COS , Ic TAN , No etc
+are defined in terms of a circle divided into 1.0
+.Dq turns
+.EQ
+delim $$
+.EN
+(equal to $2 pi$ radians, or 360 degrees).
+.EQ
+delim off
+.EN
 .Pp
 These functions are useful for automatic generation of various tables.
 For example:
 .Bd -literal -offset indent
-; Generate a table of sine values from sin(0.0) to sin(1.0), with
-; amplitude scaled from [-1.0, 1.0] to [0.0, 128.0]
-DEF turns = 0.0
-REPT 256
-    db MUL(64.0, SIN(turns) + 1.0) >> 16
-    DEF turns += 1.0 / 256
+; Generate a table of 128 sine values
+; from sin(0.0) to sin(0.5) excluded,
+; with amplitude scaled from [-1.0, 1.0] to [0.0, 128.0].
+FOR angle, 0.0, 0.5, 0.5 / 128
+    db MUL(SIN(angle) + 1.0, 128.0 / 2) >> 16
 ENDR
 .Ed
 .Ss String expressions
@@ -474,17 +562,22 @@ with its corresponding argument in
 When writing text strings that are meant to be displayed on the Game Boy, the character encoding in the ROM may need to be different than the source file encoding.
 For example, the tiles used for uppercase letters may be placed starting at tile index 128, which differs from ASCII starting at 65.
 .Pp
-Character maps allow mapping strings to arbitrary 8-bit values:
+Character maps allow mapping strings to arbitrary sequences of numbers:
 .Bd -literal -offset indent
-CHARMAP "<LF>", 10
-CHARMAP "&iacute", 20
-CHARMAP "A", 128
+CHARMAP "A", 42
+CHARMAP ":)", 39
+CHARMAP "<br>", 13, 10
+CHARMAP "&euro;", $20ac
 .Ed
 .Pp
 This would result in
-.Ql db \(dqAmen<LF>\(dq
+.Ql db \(dqAmen :)<br>\(dq
 being equivalent to
-.Ql db 128, 109, 101, 110, 10 .
+.Ql db 42, 109, 101, 110, 32, 39, 13, 10 ,
+and
+.Ql dw \(dq25&euro;\(dq
+being equivalent to
+.Ql dw 50, 53, $20ac .
 .Pp
 Any characters in a string without defined mappings will be copied directly, using the source file's encoding of characters to bytes.
 .Pp
@@ -507,8 +600,8 @@ There is also a character map stack that can be used to save and restore which c
 .Sy Note :
 Modifications to a character map take effect immediately from that point onward.
 .Ss Other functions
-There are a few other functions that do various useful things:
-.Bl -column "DEF(symbol)"
+There are a few other functions that do things beyond numeric or string operations:
+.Bl -column "SECTION(symbol)"
 .It Sy Name Ta Sy Operation
 .It Fn BANK arg Ta Returns a bank number.
 If
@@ -546,12 +639,10 @@ If
 .Ar arg
 is a section type keyword, it returns the starting address of that section type.
 The result is not constant, since only RGBLINK can compute its value.
-.It Fn DEF symbol Ta Returns TRUE (1) if
+.It Fn DEF symbol Ta Returns 1 if
 .Ar symbol
-has been defined, FALSE (0) otherwise.
+has been defined, 0 otherwise.
 String constants are not expanded within the parentheses.
-.It Fn HIGH arg Ta Returns the top 8 bits of the operand if Ar arg No is a label or constant, or the top 8-bit register if it is a 16-bit register .
-.It Fn LOW arg Ta Returns the bottom 8 bits of the operand if Ar arg No is a label or constant, or the bottom 8-bit register if it is a 16-bit register Pq Cm AF No isn't a valid register for this function .
 .It Fn ISCONST arg Ta Returns 1 if Ar arg Ap s value is known by RGBASM (e.g. if it can be an argument to
 .Ic IF ) ,
 or 0 if only RGBLINK can compute its value.
@@ -1072,7 +1163,7 @@ and so on.
 .Ed
 .Ss Variables
 An equal sign
-.Ic =
+.Sq =
 is used to define mutable numeric symbols.
 Unlike the other symbols described below, variables can be redefined.
 This is useful for internal symbols in macros, for counters, etc.
@@ -1122,7 +1213,7 @@ below).
 .Ic EQU
 is used to define immutable numeric symbols.
 Unlike
-.Ic =
+.Sq =
 above, constants defined this way cannot be redefined.
 These constants can be used for unchanging values such as properties of the hardware.
 .Bd -literal -offset indent
@@ -1378,16 +1469,15 @@ Note also that only exported symbols will appear in symbol and map files produce
 .Xr rgblink 1 .
 .Ss Purging symbols
 .Ic PURGE
-allows you to completely remove a symbol from the symbol table as if it had never existed.
-.Em USE WITH EXTREME CAUTION !
-I can't stress this enough,
-.Sy you seriously need to know what you are doing .
-DON'T purge a symbol that you use in expressions the linker needs to calculate.
-When not sure, it's probably not safe to purge anything other than variables, numeric or string constants, or macros.
+allows you to completely remove a symbol from the symbol table, as if it had never been defined.
+Be
+.Em very
+careful when purging symbols, especially labels, because it could result in unpredictable errors if something depends on the missing symbol (for example, expressions the linker needs to calculate).
 .Bd -literal -offset indent
-DEF Kamikaze EQUS  "I don't want to live anymore"
-DEF AOLer    EQUS  "Me too"
-         PURGE Kamikaze, AOLer
+DEF Kamikaze EQUS "I don't want to live anymore"
+AOLer: DB "Me too lol"
+PURGE Kamikaze, AOLer
+ASSERT !DEF(Kamikaze) && !DEF(AOLer)
 .Ed
 .Pp
 String constants are not expanded within the symbol names.
@@ -1590,17 +1680,17 @@ all have the same value, as do
 and
 .Sq Lives .
 Thus, keep in mind that
-.Ic ld [Health], a
+.Ql ld [Health], a
 is identical to
-.Ic ld [Name], a .
+.Ql ld [Name], a .
 .Pp
 The size of this union is 19 bytes, as this is the size of the largest block (the last one, containing
 .Sq VideoBuffer ) .
 Nesting unions is possible, with each inner union's size being considered as described above.
 .Pp
-Unions may be used in any section, but inside them may only be
-.Ic DS -
-like commands (see
+Unions may be used in any section, but they may only contain space-allocating directives like
+.Ic DS
+(see
 .Sx Statically allocating space in RAM ) .
 .Sh THE MACRO LANGUAGE
 .Ss Invoking macros
@@ -1800,7 +1890,7 @@ PRINTLN STRFMT("E = %f", 2.718)
 .It Ic PRINT
 prints out each of its comma-separated arguments.
 Numbers are printed as unsigned uppercase hexadecimal with a leading
-.Ic $ .
+.Sq $ .
 For different formats, use
 .Ic STRFMT .
 .It Ic PRINTLN
@@ -2120,9 +2210,8 @@ POPO
     PRINTLN $80000000/-1  ; no warning by default
 .Ed
 .Pp
-The options that
 .Ic OPT
-can modify are currently:
+can modify the options
 .Cm b , g , p , Q ,
 and
 .Cm r .

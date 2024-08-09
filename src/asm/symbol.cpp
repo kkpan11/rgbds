@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "error.hpp"
 #include "helpers.hpp" // assume
@@ -19,6 +20,7 @@
 using namespace std::literals;
 
 std::unordered_map<std::string, Symbol> symbols;
+std::unordered_set<std::string> purgedSymbols;
 
 static std::optional<std::string> labelScope = std::nullopt; // Current section's label scope
 static Symbol *PCSymbol;
@@ -106,6 +108,8 @@ static void updateSymbolFilename(Symbol &sym) {
 
 // Create a new symbol by name
 static Symbol &createSymbol(std::string const &symName) {
+	static uint32_t nextDefIndex = 0;
+
 	Symbol &sym = symbols[symName];
 
 	sym.name = symName;
@@ -115,6 +119,7 @@ static Symbol &createSymbol(std::string const &symName) {
 	sym.src = fstk_GetFileStack();
 	sym.fileLine = sym.src ? lexer_GetLineNo() : 0;
 	sym.ID = -1;
+	sym.defIndex = nextDefIndex++;
 
 	return sym;
 }
@@ -155,22 +160,45 @@ Symbol const *sym_GetPC() {
 	return PCSymbol;
 }
 
-// Purge a symbol
 void sym_Purge(std::string const &symName) {
 	Symbol *sym = sym_FindScopedValidSymbol(symName);
 
 	if (!sym) {
-		error("'%s' not defined\n", symName.c_str());
+		if (sym_IsPurgedScoped(symName))
+			error("'%s' was already purged\n", symName.c_str());
+		else
+			error("'%s' not defined\n", symName.c_str());
 	} else if (sym->isBuiltin) {
 		error("Built-in symbol '%s' cannot be purged\n", symName.c_str());
 	} else if (sym->ID != (uint32_t)-1) {
 		error("Symbol \"%s\" is referenced and thus cannot be purged\n", symName.c_str());
 	} else {
+		if (sym->isExported)
+			warning(WARNING_PURGE_1, "Purging an exported symbol \"%s\"\n", symName.c_str());
+		else if (sym->isLabel())
+			warning(WARNING_PURGE_2, "Purging a label \"%s\"\n", symName.c_str());
 		// Do not keep a reference to the label's name after purging it
 		if (sym->name == labelScope)
 			labelScope = std::nullopt;
+		purgedSymbols.emplace(sym->name);
 		symbols.erase(sym->name);
 	}
+}
+
+bool sym_IsPurgedExact(std::string const &symName) {
+	return purgedSymbols.find(symName) != purgedSymbols.end();
+}
+
+bool sym_IsPurgedScoped(std::string const &symName) {
+	if (size_t dotPos = symName.find('.'); dotPos != std::string::npos) {
+		// Check for a nonsensical reference to a nested scoped symbol
+		if (symName.find('.', dotPos + 1) != std::string::npos)
+			return false;
+		// If auto-scoped local label, expand the name
+		if (dotPos == 0 && labelScope)
+			return sym_IsPurgedExact(*labelScope + symName);
+	}
+	return sym_IsPurgedExact(symName);
 }
 
 uint32_t sym_GetPCValue() {
@@ -211,7 +239,10 @@ uint32_t sym_GetConstantValue(std::string const &symName) {
 	if (Symbol const *sym = sym_FindScopedSymbol(symName); sym)
 		return sym->getConstantValue();
 
-	error("'%s' not defined\n", symName.c_str());
+	if (sym_IsPurgedScoped(symName))
+		error("'%s' not defined; it was purged\n", symName.c_str());
+	else
+		error("'%s' not defined\n", symName.c_str());
 	return 0;
 }
 
@@ -235,6 +266,7 @@ static Symbol *createNonrelocSymbol(std::string const &symName, bool numeric) {
 
 	if (!sym) {
 		sym = &createSymbol(symName);
+		purgedSymbols.erase(sym->name);
 	} else if (sym->isDefined()) {
 		error("'%s' already defined at ", symName.c_str());
 		dumpFilename(*sym);
