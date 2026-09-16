@@ -1,26 +1,11 @@
-/* SPDX-License-Identifier: MIT */
-
-// For `execProg` (Windows is its special little snowflake again)
-#if !defined(_MSC_VER) && !defined(__MINGW32__)
-	#include <sys/stat.h>
-	#include <sys/wait.h>
-
-	#include <spawn.h>
-	#include <unistd.h>
-#else
-	#define WIN32_LEAN_AND_MEAN // Include less from `windows.h` to avoid conflicts
-	#include <windows.h>
-	#include <errhandlingapi.h>
-	#include <processthreadsapi.h>
-	#undef max // This macro conflicts with `std::numeric_limits<...>::max()`
-#endif
+// SPDX-License-Identifier: MIT
 
 #include <algorithm>
 #include <array>
-#include <cassert>
-#include <cinttypes>
+#include <assert.h>
 #include <fcntl.h>
 #include <fstream>
+#include <inttypes.h>
 #include <limits>
 #include <png.h>
 #include <stdarg.h>
@@ -29,9 +14,26 @@
 #include <string>
 #include <vector>
 
-#include "defaultinitalloc.hpp"
-
 #include "gfx/rgba.hpp" // Reused from RGBGFX
+
+// For `execProg` (Windows and POSIX spawn child processes differently)
+#if !defined(_MSC_VER) && !defined(__MINGW32__)
+	#include <sys/stat.h>
+	#include <sys/wait.h>
+
+	#include <signal.h>
+	#include <spawn.h>
+	#include <unistd.h>
+#else
+// clang-format off: maintain `include` order
+	#define WIN32_LEAN_AND_MEAN // Include less from `windows.h`
+	#include <windows.h>
+// clang-format on
+	#include <errhandlingapi.h>
+	#include <processthreadsapi.h>
+
+	#undef max // This macro conflicts with `std::numeric_limits<...>::max()`
+#endif
 
 static uintmax_t nbErrors;
 
@@ -59,7 +61,8 @@ static void error(char const *fmt, ...) {
 	}
 }
 
-[[noreturn]] static void fatal(char const *fmt, ...) {
+[[noreturn]]
+static void fatal(char const *fmt, ...) {
 	va_list ap;
 
 	fputs("FATAL: ", stderr);
@@ -85,14 +88,15 @@ class Png {
 
 	// These are cached for speed
 	uint32_t width, height;
-	DefaultInitVec<Rgba> pixels;
+	std::vector<Rgba> pixels;
 	int colorType;
 	int nbColors;
 	png_colorp embeddedPal = nullptr;
 	int nbTransparentEntries;
 	png_bytep transparencyPal = nullptr;
 
-	[[noreturn]] static void handleError(png_structp png, char const *msg) {
+	[[noreturn]]
+	static void handleError(png_structp png, char const *msg) {
 		Png *self = reinterpret_cast<Png *>(png_get_error_ptr(png));
 
 		fatal("Error reading input image (\"%s\"): %s", self->path.c_str(), msg);
@@ -115,7 +119,7 @@ class Png {
 			    "bytes after reading %zu)",
 			    self->path.c_str(),
 			    length - nbBytesRead,
-			    (size_t)self->file.pubseekoff(0, std::ios_base::cur)
+			    static_cast<size_t>(self->file.pubseekoff(0, std::ios_base::cur))
 			);
 		}
 	}
@@ -152,7 +156,7 @@ public:
 		}
 
 		png = png_create_read_struct(
-		    PNG_LIBPNG_VER_STRING, (png_voidp)this, handleError, handleWarning
+		    PNG_LIBPNG_VER_STRING, static_cast<png_voidp>(this), handleError, handleWarning
 		);
 		if (!png) {
 			fatal("Failed to allocate PNG structure: %s", strerror(errno));
@@ -166,11 +170,6 @@ public:
 
 		png_set_read_fn(png, this, readData);
 		png_set_sig_bytes(png, pngHeader.size());
-
-		// TODO: png_set_crc_action(png, PNG_CRC_ERROR_QUIT, PNG_CRC_WARN_DISCARD);
-
-		// Skipping chunks we don't use should improve performance
-		// TODO: png_set_keep_unknown_chunks(png, ...);
 
 		// Process all chunks up to but not including the image data
 		png_read_info(png, info);
@@ -196,9 +195,7 @@ public:
 			}
 		}
 
-		// Set up transformations; to turn everything into RGBA888
-		// TODO: it's not necessary to uniformize the pixel data (in theory), and not doing
-		// so *might* improve performance, and should reduce memory usage.
+		// Set up transformations to turn everything into RGBA888 for simplicity of handling
 
 		// Convert grayscale to RGB
 		switch (colorType & ~PNG_COLOR_MASK_ALPHA) {
@@ -240,7 +237,7 @@ public:
 
 		size_t nbRowBytes = png_get_rowbytes(png, info);
 		assert(nbRowBytes != 0);
-		DefaultInitVec<png_byte> row(nbRowBytes);
+		std::vector<png_byte> row(nbRowBytes);
 
 		if (interlaceType == PNG_INTERLACE_NONE) {
 			for (png_uint_32 y = 0; y < height; ++y) {
@@ -307,25 +304,10 @@ static char *execProg(char const *name, char * const *argv) {
 		return strerror(err);
 	}
 
-	siginfo_t info;
-	if (waitid(P_PID, pid, &info, WEXITED) != 0) {
+	if (int info; waitpid(pid, &info, 0) == -1 || !WIFEXITED(info)) {
 		fatal("Error waiting for %s: %s", name, strerror(errno));
-	} else if (info.si_code != CLD_EXITED) {
-		assert(info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED);
-		fatal(
-		    "%s was terminated by signal %s%s\n\tThe command was: [%s]",
-		    name,
-		    strsignal(info.si_status),
-		    info.si_code == CLD_DUMPED ? " (core dumped)" : "",
-		    formatArgv()
-		);
-	} else if (info.si_status != 0) {
-		fatal(
-		    "%s returned with status %d\n\tThe command was: [%s]",
-		    name,
-		    info.si_status,
-		    formatArgv()
-		);
+	} else if (int status = WEXITSTATUS(info); status != 0) {
+		fatal("%s returned with status %d\n\tThe command was: [%s]", name, status, formatArgv());
 	}
 
 #else // defined(_MSC_VER) || defined(__MINGW32__)
@@ -338,7 +320,7 @@ static char *execProg(char const *name, char * const *argv) {
 		        nullptr,
 		        errnum,
 		        0,
-		        (LPTSTR)&buf,
+		        reinterpret_cast<LPTSTR>(&buf),
 		        0,
 		        nullptr
 		    )
@@ -350,34 +332,17 @@ static char *execProg(char const *name, char * const *argv) {
 
 	std::vector<char> cmdLine;
 	for (size_t i = 0; argv[i]; ++i) {
-		if (i > 0)
+		if (i > 0) {
 			cmdLine.push_back(' ');
+		}
 		cmdLine.insert(cmdLine.end(), argv[i], argv[i] + strlen(argv[i]));
 	}
 	cmdLine.push_back('\0');
 
 	STARTUPINFOA startupInfo;
 	GetStartupInfoA(&startupInfo);
-	STARTUPINFOA childStartupInfo{
-	    sizeof(startupInfo),
-	    nullptr,
-	    nullptr,
-	    nullptr,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    0,
-	    nullptr,
-	    0,
-	    0,
-	    0,
-	};
+	STARTUPINFOA childStartupInfo = {};
+	childStartupInfo.cb = sizeof(startupInfo);
 
 	PROCESS_INFORMATION child;
 	if (CreateProcessA(
@@ -432,10 +397,20 @@ int main(int argc, char *argv[]) {
 
 	{
 		char path[] = "../../rgbgfx", out_opt[] = "-o", out_file[] = "result.2bpp",
-		     pal_opt[] = "-p", pal_file[] = "result.pal", attr_opt[] = "-a",
-		     attr_file[] = "result.attrmap", in_file[] = "out0.png";
+		     tmap_opt[] = "-t", tmap_file[] = "result.tilemap", pal_opt[] = "-p",
+		     pal_file[] = "result.pal", attr_opt[] = "-a", attr_file[] = "result.attrmap",
+		     in_file[] = "out0.png";
 		std::vector<char *> args(
-		    {path, out_opt, out_file, pal_opt, pal_file, attr_opt, attr_file, in_file}
+		    {path,
+		     out_opt,
+		     out_file,
+		     tmap_opt,
+		     tmap_file,
+		     pal_opt,
+		     pal_file,
+		     attr_opt,
+		     attr_file,
+		     in_file}
 		);
 		// Also copy the trailing `nullptr`
 		std::copy_n(&argv[2], argc - 1, std::back_inserter(args));
@@ -449,8 +424,9 @@ int main(int argc, char *argv[]) {
 
 	{
 		char path[] = "../../rgbgfx", reverse_opt[] = "-r", out_opt[] = "-o",
-		     out_file[] = "result.2bpp", pal_opt[] = "-p", pal_file[] = "result.pal",
-		     attr_opt[] = "-a", attr_file[] = "result.attrmap", in_file[] = "result.png";
+		     out_file[] = "result.2bpp", tmap_opt[] = "-t", tmap_file[] = "result.tilemap",
+		     pal_opt[] = "-p", pal_file[] = "result.pal", attr_opt[] = "-a",
+		     attr_file[] = "result.attrmap", in_file[] = "result.png";
 		auto width_string = std::to_string(image0.getWidth() / 8);
 		std::vector<char *> args = {
 		    path,
@@ -458,6 +434,8 @@ int main(int argc, char *argv[]) {
 		    width_string.data(),
 		    out_opt,
 		    out_file,
+		    tmap_opt,
+		    tmap_file,
 		    pal_opt,
 		    pal_file,
 		    attr_opt,

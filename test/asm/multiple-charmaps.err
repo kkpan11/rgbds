@@ -1,19 +1,21 @@
-warning: multiple-charmaps.asm(46) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-warning: multiple-charmaps.asm(54) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-warning: multiple-charmaps.asm(73) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-warning: multiple-charmaps.asm(95) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-warning: multiple-charmaps.asm(96) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-warning: multiple-charmaps.asm(104) -> multiple-charmaps.asm::print_mapped(34): [-Wnumeric-string]
-    Treating 2-character string as a number
-error: multiple-charmaps.asm(106) -> multiple-charmaps.asm::new_(9):
-    Charmap 'map1' already exists
-error: multiple-charmaps.asm(108) -> multiple-charmaps.asm::set_(15):
-    Charmap 'map5' doesn't exist
-error: multiple-charmaps.asm(110) -> multiple-charmaps.asm::pop_(30):
-    No entries in the charmap stack
-error: Assembly aborted (3 errors)!
+error: CHARVAL: No character mapping for "ab"
+    at multiple-charmaps.asm(46)
+error: CHARVAL: No character mapping for "ab"
+    at multiple-charmaps.asm(54)
+warning: Overriding charmap mapping [-Wcharmap-redef]
+    at multiple-charmaps.asm(64)
+error: CHARVAL: No character mapping for "cd"
+    at multiple-charmaps.asm(73)
+error: CHARVAL: No character mapping for "cd"
+    at multiple-charmaps.asm(95)
+error: CHARVAL: No character mapping for "ef"
+    at multiple-charmaps.asm(96)
+error: CHARVAL: No character mapping for "ab"
+    at multiple-charmaps.asm(104)
+error: Charmap `map1` is already defined
+    at multiple-charmaps.asm::new_(9) <- multiple-charmaps.asm(106)
+error: Undefined charmap `map5`
+    at multiple-charmaps.asm::set_(15) <- multiple-charmaps.asm(108)
+error: No entries in the charmap stack
+    at multiple-charmaps.asm::pop_(30) <- multiple-charmaps.asm(110)
+Assembly aborted with 9 errors

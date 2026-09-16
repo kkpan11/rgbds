@@ -1,0 +1,33 @@
+name: Code coverage report
+on:
+  - push
+  - pull_request
+
+env:
+  # Force colored output (see https://bixense.com/clicolors/ and https://force-color.org/)
+  TERM: xterm-256color
+  CLICOLOR: 1
+  CLICOLOR_FORCE: 1
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Install deps
+        run: |
+          .github/scripts/install-deps.sh ubuntu-latest lcov
+      - name: Generate coverage report
+        run: |
+          contrib/coverage.bash --os ubuntu-latest --jobs "$(getconf _NPROCESSORS_ONLN)"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          # Workaround for keeping the top-level coverage/ directory
+          # https://github.com/actions/upload-artifact/issues/174
+          path: |
+            coverage
+            dummy-file-to-keep-directory-structure.txt
+          if-no-files-found: error

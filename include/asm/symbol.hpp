@@ -1,17 +1,16 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_ASM_SYMBOL_HPP
 #define RGBDS_ASM_SYMBOL_HPP
 
 #include <memory>
-#include <optional>
 #include <stdint.h>
-#include <string.h>
 #include <string>
-#include <string_view>
 #include <time.h>
+#include <utility>
 #include <variant>
 
+#include "asm/intern.hpp"
 #include "asm/lexer.hpp"
 #include "asm/section.hpp"
 
@@ -24,27 +23,30 @@ enum SymbolType {
 	SYM_REF // Forward reference to a label
 };
 
-struct Symbol;                    // For the `sym_IsPC` forward declaration
-bool sym_IsPC(Symbol const *sym); // For the inline `getSection` method
+struct Symbol;                    // Forward declaration for `sym_IsPC`
+bool sym_IsPC(Symbol const *sym); // Forward declaration for `getSection`
 
 struct Symbol {
-	std::string name;
+	InternedStr name;
 	SymbolType type;
-	bool isExported; // Whether the symbol is to be exported
-	bool isBuiltin;  // Whether the symbol is a built-in
+	bool isBuiltin;
+	bool isExported; // Not relevant for SYM_MACRO or SYM_EQUS
+	bool isQuiet;    // Only relevant for SYM_MACRO
 	Section *section;
 	std::shared_ptr<FileStackNode> src; // Where the symbol was defined
 	uint32_t fileLine;                  // Line where the symbol was defined
 
 	std::variant<
-	    int32_t,                     // If isNumeric()
-	    int32_t (*)(),               // If isNumeric() and has a callback
-	    ContentSpan,                 // For SYM_MACRO
-	    std::shared_ptr<std::string> // For SYM_EQUS
+	    int32_t,                           // If isNumeric()
+	    int32_t (*)(),                     // If isNumeric() via a callback
+	    ContentSpan,                       // For SYM_MACRO
+	    std::shared_ptr<std::string>,      // For SYM_EQUS
+	    std::shared_ptr<std::string> (*)() // For SYM_EQUS via a callback
 	    >
 	    data;
 
-	uint32_t ID; // ID of the symbol in the object file (-1 if none)
+	uint32_t ID;       // ID of the symbol in the object file (`UINT32_MAX` if none)
+	uint32_t defIndex; // Ordering of the symbol in the state file
 
 	bool isDefined() const { return type != SYM_REF; }
 	bool isNumeric() const { return type == SYM_LABEL || type == SYM_EQU || type == SYM_VAR; }
@@ -53,7 +55,7 @@ struct Symbol {
 	bool isConstant() const {
 		if (type == SYM_LABEL) {
 			Section const *sect = getSection();
-			return sect && sect->org != (uint32_t)-1;
+			return sect && sect->org != UINT32_MAX;
 		}
 		return type == SYM_EQU || type == SYM_VAR;
 	}
@@ -67,37 +69,39 @@ struct Symbol {
 	uint32_t getConstantValue() const;
 };
 
-void sym_ForEach(void (*func)(Symbol &));
+bool sym_IsDotScope(InternedStr symName);
 
-void sym_SetExportAll(bool set);
-Symbol *sym_AddLocalLabel(std::string const &symName);
-Symbol *sym_AddLabel(std::string const &symName);
+void sym_ForEach(void (*callback)(Symbol &));
+
+Symbol *sym_AddLocalLabel(InternedStr symName);
+Symbol *sym_AddLabel(InternedStr symName);
 Symbol *sym_AddAnonLabel();
-std::string sym_MakeAnonLabelName(uint32_t ofs, bool neg);
-void sym_Export(std::string const &symName);
-Symbol *sym_AddEqu(std::string const &symName, int32_t value);
-Symbol *sym_RedefEqu(std::string const &symName, int32_t value);
-Symbol *sym_AddVar(std::string const &symName, int32_t value);
-uint32_t sym_GetPCValue();
+InternedStr sym_MakeAnonLabelName(uint32_t ofs, bool neg);
+void sym_Export(InternedStr symName);
+Symbol *sym_AddEqu(InternedStr symName, int32_t value);
+Symbol *sym_RedefEqu(InternedStr symName, int32_t value);
+Symbol *sym_AddVar(InternedStr symName, int32_t value);
 int32_t sym_GetRSValue();
 void sym_SetRSValue(int32_t value);
-uint32_t sym_GetConstantValue(std::string const &symName);
 // Find a symbol by exact name, bypassing expansion checks
-Symbol *sym_FindExactSymbol(std::string const &symName);
+Symbol *sym_FindExactSymbol(InternedStr symName);
 // Find a symbol, possibly scoped, by name
-Symbol *sym_FindScopedSymbol(std::string const &symName);
+Symbol *sym_FindScopedSymbol(InternedStr symName);
 // Find a scoped symbol by name; do not return `@` or `_NARG` when they have no value
-Symbol *sym_FindScopedValidSymbol(std::string const &symName);
+Symbol *sym_FindScopedValidSymbol(InternedStr symName);
 Symbol const *sym_GetPC();
-Symbol *sym_AddMacro(std::string const &symName, int32_t defLineNo, ContentSpan const &span);
-Symbol *sym_Ref(std::string const &symName);
-Symbol *sym_AddString(std::string const &symName, std::shared_ptr<std::string> value);
-Symbol *sym_RedefString(std::string const &symName, std::shared_ptr<std::string> value);
-void sym_Purge(std::string const &symName);
+Symbol *sym_AddMacro(InternedStr symName, int32_t defLineNo, ContentSpan const &span, bool isQuiet);
+Symbol *sym_Ref(InternedStr symName);
+Symbol *sym_AddString(InternedStr symName, std::shared_ptr<std::string> value);
+Symbol *sym_RedefString(InternedStr symName, std::shared_ptr<std::string> value);
+void sym_Purge(InternedStr symName);
+bool sym_IsPurgedExact(InternedStr symName);
+bool sym_IsPurgedScoped(InternedStr symName);
 void sym_Init(time_t now);
 
-// Functions to save and restore the current symbol scope.
-std::optional<std::string> const &sym_GetCurrentSymbolScope();
-void sym_SetCurrentSymbolScope(std::optional<std::string> const &newScope);
+// Functions to save and restore the current label scopes.
+std::pair<Symbol const *, Symbol const *> sym_GetCurrentLabelScopes();
+void sym_SetCurrentLabelScopes(std::pair<Symbol const *, Symbol const *> newScopes);
+void sym_ResetCurrentLabelScopes();
 
 #endif // RGBDS_ASM_SYMBOL_HPP

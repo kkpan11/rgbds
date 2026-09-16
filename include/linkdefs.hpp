@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_LINKDEFS_HPP
 #define RGBDS_LINKDEFS_HPP
@@ -9,7 +9,7 @@
 #include "helpers.hpp" // assume
 
 #define RGBDS_OBJECT_VERSION_STRING "RGB9"
-#define RGBDS_OBJECT_REV            10U
+#define RGBDS_OBJECT_REV            13U
 
 enum AssertionType { ASSERT_WARN, ASSERT_ERROR, ASSERT_FATAL };
 
@@ -52,6 +52,12 @@ enum RPNCommand {
 
 	RPN_HRAM = 0x60,
 	RPN_RST = 0x61,
+	RPN_BIT_INDEX = 0x62,
+
+	RPN_HIGH = 0x70,
+	RPN_LOW = 0x71,
+	RPN_BITWIDTH = 0x72,
+	RPN_TZCOUNT = 0x73,
 
 	RPN_CONST = 0x80,
 	RPN_SYM = 0x81
@@ -72,11 +78,17 @@ enum SectionType {
 	SECTTYPE_INVALID
 };
 
+static constexpr uint8_t SECTTYPE_TYPE_MASK = 0b111;
+static constexpr uint8_t SECTTYPE_UNION_BIT = 7;
+static constexpr uint8_t SECTTYPE_FRAGMENT_BIT = 6;
+
 enum FileStackNodeType {
 	NODE_REPT,
 	NODE_FILE,
 	NODE_MACRO,
 };
+
+static constexpr uint8_t FSTACKNODE_QUIET_BIT = 7;
 
 // Nont-`const` members may be patched in RGBLINK depending on CLI flags
 extern struct SectionTypeInfo {
@@ -87,30 +99,20 @@ extern struct SectionTypeInfo {
 	uint32_t lastBank;
 } sectionTypeInfo[SECTTYPE_INVALID];
 
-/*
- * Tells whether a section has data in its object file definition,
- * depending on type.
- * @param type The section's type
- * @return `true` if the section's definition includes data
- */
-static inline bool sect_HasData(SectionType type) {
+// Tells whether a section has data in its object file definition,
+// depending on type.
+static inline bool sectTypeHasData(SectionType type) {
 	assume(type != SECTTYPE_INVALID);
 	return type == SECTTYPE_ROM0 || type == SECTTYPE_ROMX;
 }
 
-/*
- * Computes a memory region's end address (last byte), eg. 0x7FFF
- * @return The address of the last byte in that memory region
- */
-static inline uint16_t endaddr(SectionType type) {
+// Returns a memory region's end address (last byte), e.g. 0x7FFF
+static inline uint16_t sectTypeEndAddr(SectionType type) {
 	return sectionTypeInfo[type].startAddr + sectionTypeInfo[type].size - 1;
 }
 
-/*
- * Computes a memory region's number of banks
- * @return The number of banks, 1 for regions without banking
- */
-static inline uint32_t nbbanks(SectionType type) {
+// Returns a memory region's number of banks, or 1 for regions without banking
+static inline uint32_t sectTypeBanks(SectionType type) {
 	return sectionTypeInfo[type].lastBank - sectionTypeInfo[type].firstBank + 1;
 }
 
@@ -118,7 +120,7 @@ enum SectionModifier { SECTION_NORMAL, SECTION_UNION, SECTION_FRAGMENT };
 
 extern char const * const sectionModNames[];
 
-enum ExportLevel { SYMTYPE_LOCAL, SYMTYPE_IMPORT, SYMTYPE_EXPORT };
+enum ExportLevel { SYMTYPE_LOCAL, SYMTYPE_IMPORT, SYMTYPE_EXPORT, SYMTYPE_INVALID };
 
 enum PatchType {
 	PATCHTYPE_BYTE,

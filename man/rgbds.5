@@ -1,18 +1,16 @@
 .\" SPDX-License-Identifier: MIT
 .\"
-.Dd December 22, 2023
+.Dd August 1, 2026
 .Dt RGBDS 5
 .Os
 .Sh NAME
 .Nm rgbds
 .Nd object file format documentation
 .Sh DESCRIPTION
-This is the description of the object files used by
+This is the description of the RGB object file format that is output by
 .Xr rgbasm 1
-and
+and read by
 .Xr rgblink 1 .
-.Em Please note that the specification is not stable yet.
-RGBDS is still in active development, and some new features require adding more information to the object file, or modifying some fields, both of which break compatibility with older versions.
 .Sh FILE STRUCTURE
 The following types are used:
 .Pp
@@ -79,18 +77,22 @@ order, meaning the node with ID 0 is the last one in the list!
 .It Cm LONG Ar ParentLineNo
 Line at which the parent node's context was exited; meaningless for the root node.
 .It Cm BYTE Ar Type
+Bits 0\(en6 indicate the node's type:
 .Bl -column "Value" -compact
 .It Sy Value Ta Sy Meaning
 .It 0 Ta REPT node
 .It 1 Ta File node
 .It 2 Ta Macro node
 .El
+.Pp
+Bit\ 7 being set means that the node is "quieted"
+.Pq see Do Excluding locations from backtraces Dc in Xr rgbasm 5 .
 .It Cm IF Ar Type No \(!= 0
 If the node is not a REPT node...
 .Pp
 .Bl -tag -width Ds -compact
 .It Cm STRING Ar Name
-The node's name: either a file name, or the macro's name prefixes by its definition's file name
+The node's name: either a file name, or the macro's name prefixed by its definition's file name
 .Pq e.g. Ql src/includes/defines.asm::error .
 .El
 .It Cm ELSE
@@ -145,6 +147,10 @@ If the symbol belongs to a section, this is the offset within that symbol's sect
 .Bl -tag -width Ds -compact
 .It Cm STRING Ar Name
 The section's name.
+.It Cm LONG Ar NodeID
+Context in which the section was defined.
+.It Cm LONG Ar LineNo
+Line number in the context at which the section was defined.
 .It Cm LONG Ar Size
 The section's size, in bytes.
 .It Cm BYTE Ar Type
@@ -250,7 +256,7 @@ Size of the
 below.
 .It Cm BYTE Ar RPNExpr Ns Bq RPNSize
 The patch's value, encoded as a RPN expression
-.Pq see Sx RPN EXPRESSIONS .
+.Pq see Sx RPN expressions .
 .El
 .It Cm ENDR
 .El
@@ -290,14 +296,14 @@ Size of the
 below.
 .It Cm BYTE Ar RPNExpr Ns Bq RPNSize
 The patch's value, encoded as a RPN expression
-.Pq see Sx RPN EXPRESSIONS .
+.Pq see Sx RPN expressions .
 .It Cm STRING Ar Message
 The message displayed if the expression evaluates to a non-zero value.
 If empty, a generic message is displayed instead.
 .El
 .It Cm ENDR
 .El
-.Ss RPN EXPRESSIONS
+.Ss RPN expressions
 Expressions in the object file are stored as RPN, or
 .Dq Reverse Polish Notation ,
 which is a notation that allows computing arbitrary expressions with just a simple stack.
@@ -384,10 +390,27 @@ The value is then ANDed with $00FF
 check.
 Checks if the value is a valid
 .Ql rst
-.Pq see Do RST vec Dc in Xr gbz80 7
-vector, that is one of $00, $08, $10, $18, $20, $28, $30, or $38.
+vector
+.Pq see Do RST vec Dc in Xr gbz80 7 ,
+that is, one of $00, $08, $10, $18, $20, $28, $30, or $38.
 The value is then ORed with $C7
 .Pq Ql \&| $C7 .
+.It Li $62 Ta Ql bit/res/set
+check; followed by the instruction's
+.Cm BYTE
+mask.
+Checks if the value is a valid bit index
+.Pq see e.g. Do BIT u3, r8 Dc in Xr gbz80 7 ,
+that is, from 0 to 7.
+The value is then ORed with the instruction's mask.
+.It Li $70 Ta Cm HIGH
+byte.
+.It Li $71 Ta Cm LOW
+byte.
+.It Li $72 Ta Cm BITWIDTH
+value.
+.It Li $73 Ta Cm TZCOUNT
+value.
 .It Li $80 Ta Integer literal; followed by the
 .Cm LONG
 integer.

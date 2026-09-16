@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 
-[[ -e ./rgbgfx_test ]] || make -C ../.. test/gfx/rgbgfx_test || exit
-[[ -e ./randtilegen ]] || make -C ../.. test/gfx/randtilegen || exit
+[[ -e ./rgbgfx_test ]] || make -C ../.. test/gfx/rgbgfx_test Q= ${CXX:+"CXX=$CXX"} || exit
+[[ -e ./randtilegen ]] || make -C ../.. test/gfx/randtilegen Q= ${CXX:+"CXX=$CXX"} || exit
 
-trap 'rm -f "$errtmp"' EXIT
+export LC_ALL=C
+
+# Screen width for help/usage text (for reproducible test results)
+export COLUMNS=79
+shopt -u checkwinsize # Prevent subsequent commands from resetting `COLUMNS`
+
 errtmp="$(mktemp)"
+
+# shellcheck disable=SC2064 # (Immediate expansion is the desired behavior.)
+trap "rm -f ${errtmp@Q} result.{png,1bpp,2bpp,pal,tilemap,attrmap,palmap} out*.png" EXIT
+
+tests=0
+failed=0
+rc=0
 
 bold="$(tput bold)"
 resbold="$(tput sgr0)"
@@ -14,65 +26,103 @@ rescolors="$(tput op)"
 
 RGBGFX=../../rgbgfx
 
-tests=0
-failed=0
-rc=0
-
-new_test() {
+newTest () {
 	cmdline="$*"
 	echo "${bold}${green}Testing: ${cmdline}${rescolors}${resbold}" >&2
 }
-test() {
+
+runTest () {
 	(( tests++ ))
 	eval "$cmdline"
 }
-fail() {
+
+failTest () {
 	rc=1
 	(( failed++ ))
 	echo "${bold}${red}Test ${cmdline} failed!${1:+ (RC=$1)}${rescolors}${resbold}"
 }
 
+tryCmp () {
+	if ! cmp "$1" "$2"; then
+		../../contrib/gbdiff.bash "$1" "$2"
+		echo "${bold}${red}$1 mismatch!${rescolors}${resbold}"
+		false
+	fi
+}
+
+checkOutput () {
+	out_rc=0
+	for ext in 1bpp 2bpp pal tilemap attrmap palmap; do
+		if [[ -e "$1.out.$ext" ]]; then
+			tryCmp "$1.out.$ext" "result.$ext"
+			(( out_rc = out_rc || $? ))
+		fi
+	done
+	return $out_rc
+}
 
 # Draw a random tile offset and VRAM0 size
 # Neither should change anything to how the image is displayed
 while [[ "$ofs" -eq 0 ]]; do (( ofs = RANDOM % 256 )); done
 while [[ "$size" -eq 0 ]]; do (( size = RANDOM % 256 )); done
-for f in *.bin; do
+for f in seed*.bin; do
 	for flags in ""{," -b $ofs"}{," -N $size,256"}; do
-		new_test ./rgbgfx_test "$f" $flags
-		test || fail $?
+		newTest ./rgbgfx_test "$f" $flags
+		runTest || failTest $?
 	done
 done
 
-# Test round-tripping '-r' with '-c #none'
-reverse_cmd="$RGBGFX -c#none,#fff,#000 -o none_round_trip.2bpp -r 1 out.png"
-reconvert_cmd="$RGBGFX -c#none,#fff,#000 -o result.2bpp out.png"
-compare_cmd="cmp none_round_trip.2bpp result.2bpp"
-new_test "$reverse_cmd && $reconvert_cmd && $compare_cmd"
-test || fail $?
-
-# Remove temporaries (also ignored by Git) created by the above tests
-rm -f out*.png result.png result.2bpp
-
 for f in *.png; do
-	flags="$([[ -e "${f%.png}.flags" ]] && echo "@${f%.png}.flags")"
-
-	new_test "$RGBGFX" $flags "$f"
-	if [[ -e "${f%.png}.err" ]]; then
-		test 2>"$errtmp"
-		diff -u --strip-trailing-cr "${f%.png}.err" "$errtmp" || fail
-	else
-		test || fail $?
+	# Do not process outputs or palette inputs of other tests as test inputs themselves
+	if [[ "$f" = result.png ]] || [[ "$f" = *.pal.png ]]; then
+		continue
 	fi
 
-	new_test "$RGBGFX" $flags - "<$f"
+	flags="$([[ -e "${f%.png}.flags" ]] && echo "@${f%.png}.flags")"
+	for f_ext in o_1bpp o_2bpp p_pal t_tilemap a_attrmap q_palmap; do
+		if [[ -e "${f%.png}.out.${f_ext#*_}" ]]; then
+			flags="$flags -${f_ext%_*} result.${f_ext#*_}"
+		fi
+	done
+
+	newTest "$RGBGFX" $flags "$f"
 	if [[ -e "${f%.png}.err" ]]; then
-		test 2>"$errtmp"
-		diff -u --strip-trailing-cr <(sed "s/$f/<stdin>/g" "${f%.png}.err") "$errtmp" || fail
+		runTest 2>"$errtmp"
+		diff -au --strip-trailing-cr "${f%.png}.err" "$errtmp" || failTest
 	else
-		test || fail $?
+		runTest && checkOutput "${f%.png}" || failTest $?
+	fi
+
+	newTest "$RGBGFX" $flags - "<$f"
+	if [[ -e "${f%.png}.err" ]]; then
+		runTest 2>"$errtmp"
+		diff -au --strip-trailing-cr <(sed "s/$f/<stdin>/g" "${f%.png}.err") "$errtmp" || failTest
+	else
+		runTest && checkOutput "${f%.png}" || failTest $?
 	fi
 done
+
+for f in *.[12]bpp; do
+	# Do not process outputs or sample outputs of other tests as test inputs themselves
+	if [[ "$f" = result.[12]bpp ]] || [[ "$f" = *.in.[12]bpp ]] || [[ "$f" = *.out.[12]bpp ]]; then
+		continue
+	fi
+
+	flags="$([[ -e "${f%.[12]bpp}.flags" ]] && echo "@${f%.[12]bpp}.flags") $([[ -e "${f%.1bpp}.flags" ]] && echo "-d 1")"
+
+	if [[ -e "${f%.[12]bpp}.err" ]]; then
+		newTest "$RGBGFX $flags -o $f -r 1 result.png"
+		runTest 2>"$errtmp"
+		diff -au --strip-trailing-cr <(sed "s/$f/<stdin>/g" "${f%.[12]bpp}.err") "$errtmp" || failTest
+	else
+		newTest "$RGBGFX $flags -o $f -r 1 result.png && $RGBGFX $flags -o result.2bpp result.png"
+		runTest && tryCmp "$f" result.2bpp || failTest $?
+	fi
+done
+
+# Test writing to stdout
+newTest "$RGBGFX -m -o - write_stdout.bin > result.2bpp"
+runTest && tryCmp write_stdout.out.2bpp result.2bpp || failTest $?
 
 if [[ "$failed" -eq 0 ]]; then
 	echo "${bold}${green}All ${tests} tests passed!${rescolors}${resbold}"

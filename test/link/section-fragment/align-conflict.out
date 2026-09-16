@@ -1,0 +1,8 @@
+FATAL: Section "conflicting alignment" is defined with 4-byte alignment (offset 0), but also with address $1337
+    at section-fragment/align-conflict.asm(7)
+    and also:
+    at section-fragment/align-conflict.asm(7)
+Linking aborted with 1 error
+---
+FATAL: Section "conflicting alignment" already declared as aligned to 4 bytes (offset 0)
+    at <stdin>(18)

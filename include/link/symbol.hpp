@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_LINK_SYMBOL_HPP
 #define RGBDS_LINK_SYMBOL_HPP
@@ -25,7 +25,6 @@ struct Symbol {
 	// Info contained in the object files
 	std::string name;
 	ExportLevel type;
-	char const *objFileName;
 	FileStackNode const *src;
 	int32_t lineNo;
 	std::variant<
@@ -34,17 +33,17 @@ struct Symbol {
 	    >
 	    data;
 
-	Label &label();
-	Label const &label() const;
+	void linkToSection(Section &section);
+	void fixSectionOffset();
 };
+
+void sym_ForEach(void (*callback)(Symbol &));
 
 void sym_AddSymbol(Symbol &symbol);
 
-/*
- * Finds a symbol in all the defined symbols.
- * @param name The name of the symbol to look for
- * @return A pointer to the symbol, or `nullptr` if not found.
- */
+// Finds a symbol in all the defined symbols.
 Symbol *sym_GetSymbol(std::string const &name);
+
+void sym_TraceLocalAliasedSymbols(std::string const &name);
 
 #endif // RGBDS_LINK_SYMBOL_HPP

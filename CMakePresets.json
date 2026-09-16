@@ -1,0 +1,46 @@
+{
+	"version": 3,
+	"configurePresets": [
+		{
+			"name": "develop",
+			"description": "Debugging config for maintainers",
+			"cacheVariables": {
+				"CMAKE_BUILD_TYPE": "Debug",
+				"CMAKE_EXPORT_COMPILE_COMMANDS": true,
+				"CMAKE_COMPILE_WARNING_AS_ERROR": true,
+				"CMAKE_LINK_WARNING_AS_ERROR": true,
+				"MORE_WARNINGS": true,
+				"SANITIZERS": true
+			},
+			"warnings": { "uninitialized": true },
+			"errors": { "dev": true }
+		},
+		{
+			"name": "develop-msbuild32",
+			"inherits": ["develop", "msbuild32"]
+		},
+		{
+			"name": "develop-msbuild64",
+			"inherits": ["develop", "msbuild64"]
+		},
+
+		{
+			"name": "msbuild32",
+			"description": "Flags for building 32-bit executables with MSBuild",
+			"architecture": "Win32"
+		},
+		{
+			"name": "msbuild64",
+			"description": "Flags for building 64-bit executables with MSBuild",
+			"architecture": "x64"
+		},
+
+		{
+			"name": "macos-static",
+			"description": "Flags for building an executable compatible with old macOS",
+			"cacheVariables": {
+				"CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "cmake/macos-static.cmake"
+			}
+		}
+	]
+}

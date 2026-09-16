@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_ASM_RPN_HPP
 #define RGBDS_ASM_RPN_HPP
@@ -10,57 +10,59 @@
 
 #include "linkdefs.hpp"
 
+#include "asm/intern.hpp"
+
 struct Symbol;
+
+struct RPNValue {
+	RPNCommand command;                                                // The RPN_* command ID
+	std::variant<std::monostate, uint8_t, uint32_t, InternedStr> data; // Data after the ID, if any
+
+	RPNValue(RPNCommand cmd);
+	RPNValue(RPNCommand cmd, uint8_t val);
+	RPNValue(RPNCommand cmd, uint32_t val);
+	RPNValue(RPNCommand cmd, InternedStr name);
+
+	void appendEncoded(std::vector<uint8_t> &buffer) const;
+};
 
 struct Expression {
 	std::variant<
-		int32_t,    // If the expression's value is known, it's here
-		std::string // Why the expression is not known, if it isn't
-	> data = 0;
-	bool isSymbol = false; // Whether the expression represents a symbol suitable for const diffing
-	std::vector<uint8_t> rpn{}; // Bytes serializing the RPN expression
-	uint32_t rpnPatchSize = 0;  // Size the expression will take in the object file
-
-	Expression() = default;
-	Expression(Expression &&) = default;
-#ifdef _MSC_VER
-	// MSVC and WinFlexBison won't build without this...
-	Expression(Expression const &) = default;
-#endif
-
-	Expression &operator=(Expression &&) = default;
+	    int32_t,    // If the expression's value is known, it's here
+	    std::string // Why the expression is not known, if it isn't
+	    >
+	    data = 0;
+	std::vector<RPNValue> rpn{}; // Values to be serialized into the RPN expression
 
 	bool isKnown() const { return std::holds_alternative<int32_t>(data); }
-	int32_t value() const;
+	int32_t value() const { return std::get<int32_t>(data); }
 
 	int32_t getConstVal() const;
 	Symbol const *symbolOf() const;
 	bool isDiffConstant(Symbol const *symName) const;
 
 	void makeNumber(uint32_t value);
-	void makeSymbol(std::string const &symName);
-	void makeBankSymbol(std::string const &symName);
+	void makeSymbol(InternedStr symName);
+	void makeBankSymbol(InternedStr symName);
 	void makeBankSection(std::string const &sectName);
 	void makeSizeOfSection(std::string const &sectName);
 	void makeStartOfSection(std::string const &sectName);
 	void makeSizeOfSectionType(SectionType type);
 	void makeStartOfSectionType(SectionType type);
-	void makeHigh();
-	void makeLow();
-	void makeNeg();
-	void makeNot();
-	void makeLogicNot();
+	void makeUnaryOp(RPNCommand op, Expression &&src);
 	void makeBinaryOp(RPNCommand op, Expression &&src1, Expression const &src2);
 
-	void makeCheckHRAM();
-	void makeCheckRST();
+	void addCheckHRAM();
+	void addCheckRST();
+	void addCheckBitIndex(uint8_t mask);
 
 	void checkNBit(uint8_t n) const;
+	void checkSignedNBit(uint8_t n) const;
 
-private:
-	void clear();
-	uint8_t *reserveSpace(uint32_t size);
-	uint8_t *reserveSpace(uint32_t size, uint32_t patchSize);
+	void encode(std::vector<uint8_t> &buffer) const;
 };
+
+bool checkNBit(int32_t v, uint8_t n, char const *name);
+bool checkSignedNBit(int32_t v, uint8_t n, char const *name);
 
 #endif // RGBDS_ASM_RPN_HPP

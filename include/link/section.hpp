@@ -1,19 +1,15 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_LINK_SECTION_HPP
 #define RGBDS_LINK_SECTION_HPP
 
-// GUIDELINE: external code MUST NOT BE AWARE of the data structure used!
-
-#include <deque>
 #include <memory>
 #include <stdint.h>
 #include <string>
 #include <vector>
 
+#include "helpers.hpp" // QualifiedEquivalent
 #include "linkdefs.hpp"
-
-#include "link/main.hpp"
 
 struct FileStackNode;
 struct Section;
@@ -46,46 +42,60 @@ struct Section {
 	bool isAlignFixed;
 	uint16_t alignMask;
 	uint16_t alignOfs;
+	FileStackNode const *src;
+	int32_t lineNo;
 	std::vector<uint8_t> data; // Array of size `size`, or 0 if `type` does not have data
 	std::vector<Patch> patches;
 	// Extra info computed during linking
 	std::vector<Symbol> *fileSymbols;
 	std::vector<Symbol *> symbols;
-	std::unique_ptr<Section> nextu; // The next "component" of this unionized sect
+	std::unique_ptr<Section> nextPiece; // The next fragment or union "piece" of this section
+
+private:
+	// Template class for both const and non-const iterators over the "pieces" of this section
+	template<QualifiedEquivalent<Section> SectionT>
+	class PiecesIterable {
+		SectionT *_firstPiece;
+
+		class Iterator {
+			SectionT *_piece;
+
+		public:
+			explicit Iterator(SectionT *piece) : _piece(piece) {}
+
+			Iterator &operator++() {
+				_piece = _piece->nextPiece.get();
+				return *this;
+			}
+
+			SectionT &operator*() const { return *_piece; }
+
+			bool operator==(Iterator const &rhs) const { return _piece == rhs._piece; }
+		};
+
+	public:
+		explicit PiecesIterable(SectionT *firstPiece) : _firstPiece(firstPiece) {}
+
+		Iterator begin() { return Iterator(_firstPiece); }
+		Iterator end() { return Iterator(nullptr); }
+	};
+
+public:
+	PiecesIterable<Section> pieces() { return PiecesIterable(this); }
+	PiecesIterable<Section const> pieces() const { return PiecesIterable(this); }
 };
 
-struct Assertion {
-	Patch patch; // Also used for its `.type`
-	std::string message;
-	// This would be redundant with `.section->fileSymbols`, but `section` is sometimes `nullptr`!
-	std::vector<Symbol> *fileSymbols;
-};
-
-extern std::deque<Assertion> assertions;
-
-/*
- * Execute a callback for each section currently registered.
- * This is to avoid exposing the data structure in which sections are stored.
- * @param callback The function to call for each structure.
- */
+// Execute a callback for each section currently registered.
+// This is to avoid exposing the data structure in which sections are stored.
 void sect_ForEach(void (*callback)(Section &));
 
-/*
- * Registers a section to be processed.
- * @param section The section to register.
- */
+// Registers a section to be processed.
 void sect_AddSection(std::unique_ptr<Section> &&section);
 
-/*
- * Finds a section by its name.
- * @param name The name of the section to look for
- * @return A pointer to the section, or `nullptr` if it wasn't found
- */
+// Finds a section by its name.
 Section *sect_GetSection(std::string const &name);
 
-/*
- * Checks if all sections meet reasonable criteria, such as max size
- */
+// Checks if all sections meet reasonable criteria, such as max size
 void sect_DoSanityChecks();
 
 #endif // RGBDS_LINK_SECTION_HPP

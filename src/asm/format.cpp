@@ -1,81 +1,69 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #include "asm/format.hpp"
 
 #include <algorithm>
 #include <inttypes.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
-#include "asm/fixpoint.hpp"
+#include "util.hpp" // parseNumber
+
+#include "asm/main.hpp" // options
 #include "asm/warning.hpp"
 
-void FormatSpec::useCharacter(int c) {
-	if (state == FORMAT_INVALID)
-		return;
+size_t FormatSpec::parseSpec(char const *spec) {
+	size_t i = 0;
 
-	switch (c) {
-	// sign
-	case ' ':
-	case '+':
-		if (state > FORMAT_SIGN)
-			goto invalid;
-		state = FORMAT_PREFIX;
+	auto parseSpecNumber = [&spec, &i]() {
+		char const *end = &spec[i];
+		size_t number = parseNumber(end, BASE_10).value_or(0);
+		i += end - &spec[i];
+		return number;
+	};
+
+	// <sign>
+	if (char c = spec[i]; c == ' ' || c == '+') {
+		++i;
 		sign = c;
-		break;
-
-	// prefix
-	case '#':
-		if (state > FORMAT_PREFIX)
-			goto invalid;
-		state = FORMAT_ALIGN;
-		prefix = true;
-		break;
-
-	// align
-	case '-':
-		if (state > FORMAT_ALIGN)
-			goto invalid;
-		state = FORMAT_WIDTH;
+	}
+	// <exact>
+	if (spec[i] == '#') {
+		++i;
+		exact = true;
+	}
+	// <align>
+	if (spec[i] == '-') {
+		++i;
 		alignLeft = true;
-		break;
-
-	// pad and width
-	case '0':
-		if (state < FORMAT_WIDTH)
-			padZero = true;
-		[[fallthrough]];
-	case '1':
-	case '2':
-	case '3':
-	case '4':
-	case '5':
-	case '6':
-	case '7':
-	case '8':
-	case '9':
-		if (state < FORMAT_WIDTH) {
-			state = FORMAT_WIDTH;
-			width = c - '0';
-		} else if (state == FORMAT_WIDTH) {
-			width = width * 10 + (c - '0');
-		} else if (state == FORMAT_FRAC) {
-			fracWidth = fracWidth * 10 + (c - '0');
-		} else {
-			goto invalid;
-		}
-		break;
-
-	case '.':
-		if (state > FORMAT_WIDTH)
-			goto invalid;
-		state = FORMAT_FRAC;
+	}
+	// <pad>
+	if (spec[i] == '0') {
+		++i;
+		padZero = true;
+	}
+	// <width>
+	if (isDigit<10>(spec[i])) {
+		width = parseSpecNumber();
+	}
+	// <frac>
+	if (spec[i] == '.') {
+		++i;
 		hasFrac = true;
-		break;
-
-	// type
+		fracWidth = parseSpecNumber();
+	}
+	// <prec>
+	if (spec[i] == 'q') {
+		++i;
+		hasPrec = true;
+		precision = parseSpecNumber();
+	}
+	// <type>
+	switch (char c = spec[i]; c) {
 	case 'd':
 	case 'u':
 	case 'X':
@@ -84,133 +72,180 @@ void FormatSpec::useCharacter(int c) {
 	case 'o':
 	case 'f':
 	case 's':
-		if (state >= FORMAT_DONE)
-			goto invalid;
-		state = FORMAT_DONE;
-		valid = true;
+		++i;
 		type = c;
 		break;
-
-	default:
-invalid:
-		state = FORMAT_INVALID;
-		valid = false;
 	}
+	// Done parsing
+	parsed = true;
+	return i;
 }
 
-void FormatSpec::finishCharacters() {
-	if (!isValid())
-		state = FORMAT_INVALID;
+static std::string escapeString(std::string const &str) {
+	std::string escaped;
+	for (char c : str) {
+		// Escape characters that need escaping
+		switch (c) {
+		case '\n':
+			escaped += "\\n";
+			break;
+		case '\r':
+			escaped += "\\r";
+			break;
+		case '\t':
+			escaped += "\\t";
+			break;
+		case '\0':
+			escaped += "\\0";
+			break;
+		case '\\':
+		case '"':
+		case '{':
+			escaped += '\\';
+			[[fallthrough]];
+		default:
+			escaped += c;
+			break;
+		}
+	}
+	return escaped;
 }
 
 void FormatSpec::appendString(std::string &str, std::string const &value) const {
 	int useType = type;
-	if (isEmpty()) {
+	if (!useType) {
 		// No format was specified
 		useType = 's';
 	}
 
-	if (sign)
-		error("Formatting string with sign flag '%c'\n", sign);
-	if (prefix)
-		error("Formatting string with prefix flag '#'\n");
-	if (padZero)
-		error("Formatting string with padding flag '0'\n");
-	if (hasFrac)
-		error("Formatting string with fractional width\n");
-	if (useType != 's')
-		error("Formatting string as type '%c'\n", useType);
+	if (sign) {
+		error("Formatting string with sign flag '%c'", sign);
+	}
+	if (padZero) {
+		error("Formatting string with padding flag '0'");
+	}
+	if (hasFrac) {
+		error("Formatting string with fractional width");
+	}
+	if (hasPrec) {
+		error("Formatting string with fractional precision");
+	}
+	if (useType != 's') {
+		error("Formatting string as type '%c'", useType);
+	}
 
-	size_t valueLen = value.length();
+	std::string useValue = exact ? escapeString(value) : value;
+	size_t valueLen = useValue.length();
 	size_t totalLen = width > valueLen ? width : valueLen;
 	size_t padLen = totalLen - valueLen;
 
 	str.reserve(str.length() + totalLen);
 	if (alignLeft) {
-		str.append(value);
+		str.append(useValue);
 		str.append(padLen, ' ');
 	} else {
 		str.append(padLen, ' ');
-		str.append(value);
+		str.append(useValue);
 	}
 }
 
 void FormatSpec::appendNumber(std::string &str, uint32_t value) const {
 	int useType = type;
-	bool usePrefix = prefix;
-	if (isEmpty()) {
+	bool useExact = exact;
+	if (!useType) {
 		// No format was specified; default to uppercase $hex
 		useType = 'X';
-		usePrefix = true;
+		useExact = true;
 	}
 
-	if (useType != 'X' && useType != 'x' && useType != 'b' && useType != 'o' && usePrefix)
-		error("Formatting type '%c' with prefix flag '#'\n", useType);
-	if (useType != 'f' && hasFrac)
-		error("Formatting type '%c' with fractional width\n", useType);
-	if (useType == 's')
-		error("Formatting number as type 's'\n");
+	if (useType != 'X' && useType != 'x' && useType != 'b' && useType != 'o' && useType != 'f'
+	    && useExact) {
+		error("Formatting type '%c' with exact flag '#'", useType);
+	}
+	if (useType != 'f' && hasFrac) {
+		error("Formatting type '%c' with fractional width", useType);
+	}
+	if (useType != 'f' && hasPrec) {
+		error("Formatting type '%c' with fractional precision", useType);
+	}
+	if (useType == 's') {
+		error("Formatting number as type 's'");
+	}
 
 	char signChar = sign; // 0 or ' ' or '+'
 
 	if (useType == 'd' || useType == 'f') {
 		if (int32_t v = value; v < 0) {
 			signChar = '-';
-			if (v != INT32_MIN)
+			if (v != INT32_MIN) { // -INT32_MIN is UB
 				value = -v;
+			}
 		}
 	}
 
-	char prefixChar = !usePrefix       ? 0
-	                  : useType == 'X' ? '$'
-	                  : useType == 'x' ? '$'
-	                  : useType == 'b' ? '%'
-	                  : useType == 'o' ? '&'
-	                                   : 0;
-
-	char valueBuf[262]; // Max 5 digits + decimal + 255 fraction digits + terminator
-
+	// The longest possible formatted number is fixed-point with 10 digits, 255 fractional digits,
+	// and a precision suffix, for 270 total bytes (counting the NUL terminator).
+	// (Actually 269 since a 2-digit precision cannot reach 10 integer digits.)
+	// Make the buffer somewhat larger just in case.
+	char valueBuf[300];
 	if (useType == 'b') {
-		// Special case for binary
-		char *ptr = valueBuf;
+		// Special case for binary (since `snprintf` doesn't support it)
 
+		// Buffer the digits from least to greatest
+		char *ptr = valueBuf;
 		do {
 			*ptr++ = (value & 1) + '0';
 			value >>= 1;
 		} while (value);
 
-		// Reverse the digits
+		// Reverse the digits and terminate the string
 		std::reverse(valueBuf, ptr);
-
 		*ptr = '\0';
 	} else if (useType == 'f') {
-		// Special case for fixed-point
+		// Special case for fixed-point (since it needs fractional part and precision)
 
 		// Default fractional width (C++'s is 6 for "%f"; here 5 is enough for Q16.16)
 		size_t useFracWidth = hasFrac ? fracWidth : 5;
-
 		if (useFracWidth > 255) {
-			error("Fractional width %zu too long, limiting to 255\n", useFracWidth);
+			error("Fractional width %zu too long, limiting to 255", useFracWidth);
 			useFracWidth = 255;
 		}
 
-		double fval = fabs(value / fix_PrecisionFactor());
-		snprintf(valueBuf, sizeof(valueBuf), "%.*f", (int)useFracWidth, fval);
-	} else if (useType == 'd') {
-		// Decimal numbers may be formatted with a '-' sign by `snprintf`, so `abs` prevents that,
-		// with a special case for `INT32_MIN` since `labs(INT32_MIN)` is UB. The sign will be
-		// printed later from `signChar`.
-		uint32_t uval = value != (uint32_t)INT32_MIN ? labs((int32_t)value) : value;
-		snprintf(valueBuf, sizeof(valueBuf), "%" PRIu32, uval);
-	} else {
-		char const *spec = useType == 'u'   ? "%" PRIu32
-		                   : useType == 'X' ? "%" PRIX32
-		                   : useType == 'x' ? "%" PRIx32
-		                   : useType == 'o' ? "%" PRIo32
-		                                    : "%" PRIu32;
+		// Default precision taken from default `-Q` option
+		size_t defaultPrec = options.fixPrecision;
+		size_t usePrec = hasPrec ? precision : defaultPrec;
+		if (usePrec < 1 || usePrec > 31) {
+			error(
+			    "Fixed-point constant precision %zu invalid, defaulting to %zu",
+			    usePrec,
+			    defaultPrec
+			);
+			usePrec = defaultPrec;
+		}
 
+		// Floating-point formatting works for all fixed-point values
+		double fval = fabs(value / pow(2.0, usePrec));
+		if (int fracWidthArg = static_cast<int>(useFracWidth); useExact) {
+			snprintf(valueBuf, sizeof(valueBuf), "%.*fq%zu", fracWidthArg, fval, usePrec);
+		} else {
+			snprintf(valueBuf, sizeof(valueBuf), "%.*f", fracWidthArg, fval);
+		}
+	} else {
+		// `value` has already been made non-negative, so type 'd' is OK here even for `INT32_MIN`.
+		// The sign will be printed later from `signChar`.
+		char const *spec = useType == 'd' || useType == 'u' ? "%" PRIu32
+		                   : useType == 'X'                 ? "%" PRIX32
+		                   : useType == 'x'                 ? "%" PRIx32
+		                   : useType == 'o'                 ? "%" PRIo32
+		                                                    : "%" PRIu32;
 		snprintf(valueBuf, sizeof(valueBuf), spec, value);
 	}
+
+	char prefixChar = !useExact                          ? 0
+	                  : useType == 'X' || useType == 'x' ? '$'
+	                  : useType == 'b'                   ? '%'
+	                  : useType == 'o'                   ? '&'
+	                                                     : 0;
 
 	size_t valueLen = strlen(valueBuf);
 	size_t numLen = (signChar != 0) + (prefixChar != 0) + valueLen;
@@ -219,27 +254,33 @@ void FormatSpec::appendNumber(std::string &str, uint32_t value) const {
 
 	str.reserve(str.length() + totalLen);
 	if (alignLeft) {
-		if (signChar)
+		if (signChar) {
 			str += signChar;
-		if (prefixChar)
+		}
+		if (prefixChar) {
 			str += prefixChar;
+		}
 		str.append(valueBuf);
 		str.append(padLen, ' ');
 	} else {
 		if (padZero) {
 			// sign, then prefix, then zero padding
-			if (signChar)
+			if (signChar) {
 				str += signChar;
-			if (prefixChar)
+			}
+			if (prefixChar) {
 				str += prefixChar;
+			}
 			str.append(padLen, '0');
 		} else {
 			// space padding, then sign, then prefix
 			str.append(padLen, ' ');
-			if (signChar)
+			if (signChar) {
 				str += signChar;
-			if (prefixChar)
+			}
+			if (prefixChar) {
 				str += prefixChar;
+			}
 		}
 		str.append(valueBuf);
 	}

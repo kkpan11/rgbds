@@ -16,7 +16,10 @@ def fr = MUL(20.0, 0.32)
 def q8 = 1.25q8
 def q16 = 1.25Q16
 def q24 = 1.25q.24
-	println "Q8 ${x:q8} Q16 ${x:q16} Q24 ${x:q24}"
+	println "{#f:q8} {#f:q16} {#f:q24}"
+	println "Q8 {#x:q8} Q16 {#x:q16} Q24 {#x:q24}"
 
 def qerr = 1.25q32
-	println qerr
+	println "{q0f:qerr}"
+def qerr = 1.25q264
+	println "{q999f:qerr}"

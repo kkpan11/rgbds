@@ -3,6 +3,21 @@ assert !DEF(@)
 println @
 println "{@}?"
 
+; not inside a section
+assert !DEF(__SCOPE__)
+println __SCOPE__
+println "{__SCOPE__}?"
+
+; not inside a global scope
+assert !DEF(.)
+println .
+println "{.}?"
+
+; not inside a local scope
+assert !DEF(..)
+println ..
+println "{..}?"
+
 ; not inside a macro
 assert !DEF(_NARG)
 println _NARG
@@ -12,6 +27,20 @@ SECTION "s", ROM0[$42]
 assert DEF(@)
 println @
 println "{@}!"
+
+assert DEF(__SCOPE__)
+println __SCOPE__
+println "{__SCOPE__}!"
+
+GlobalScope:
+assert DEF(.)
+println .
+println "{.}!"
+
+.localScope:
+assert DEF(..)
+println ..
+println "{..}!"
 
 MACRO m
 	assert DEF(_NARG)

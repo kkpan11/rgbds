@@ -1,3 +1,2 @@
-error: local-without-parent.asm(2):
-    Unqualified local label '.test' in main scope
-error: Assembly aborted (1 error)!
+FATAL: Unqualified local label `.test` in main scope
+    at local-without-parent.asm(3)

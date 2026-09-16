@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 /*
  * Originally:
@@ -37,7 +37,7 @@ static unsigned long long getRandomBits(unsigned count) {
 		if (data == EOF) {
 			exit(0);
 		}
-		randbits |= (unsigned long long)data << randcount;
+		randbits |= static_cast<unsigned long long>(data) << randcount;
 		randcount += 8;
 	}
 	unsigned long long result = randbits & ((1ULL << count) - 1);
@@ -217,8 +217,8 @@ static void write_image(
 }
 
 static void generate_random_image(char const *filename) {
-#define MIN_TILES_PER_SIDE 3
-#define MAX_TILES          ((MIN_TILES_PER_SIDE + 7) * (MIN_TILES_PER_SIDE + 7))
+	static constexpr uint8_t MIN_TILES_PER_SIDE = 3;
+	static constexpr uint8_t MAX_TILES = (MIN_TILES_PER_SIDE + 7) * (MIN_TILES_PER_SIDE + 7);
 	Attributes attributes[MAX_TILES];
 	unsigned char tileData[MAX_TILES][8][8];
 	uint8_t width = getRandomBits(3) + MIN_TILES_PER_SIDE,

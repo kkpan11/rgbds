@@ -1,43 +1,44 @@
 # SPDX-License-Identifier: MIT
 
-configure_file(version.cpp _version.cpp ESCAPE_QUOTES)
-
-set(common_src
-    "error.cpp"
+add_library(common OBJECT
     "extern/getopt.cpp"
-    "_version.cpp"
-    )
+    "cli.cpp"
+    "diagnostics.cpp"
+    "style.cpp"
+    "usage.cpp"
+    "util.cpp"
+    "version.cpp"
+)
+target_compile_definitions(common PRIVATE "BUILD_VERSION_STRING=\"${RGBDS_VERSION_STRING}\"")
 
 find_package(BISON 3.0.0 REQUIRED)
-set(BISON_FLAGS "-Wall -Dparse.lac=full -Dlr.type=ielr")
-# Set some optimization flags on versions that support them
+# BISON 4.0 deprecates passing this BISON_FLAGS string to `bison_target`'s `COMPILE_FLAGS`,
+# in favor of passing a list to `OPTIONS`, but that would require dropping support for CMake <4.0.
+set(BISON_FLAGS "-Wall -Dlr.type=ielr")
+# Set some flags on versions that support them.
 if(BISON_VERSION VERSION_GREATER_EQUAL "3.5")
-  set(BISON_FLAGS "${BISON_FLAGS} -Dapi.token.raw=true")
+  set(BISON_FLAGS "${BISON_FLAGS} -Dparse.lac=full -Dapi.token.raw=true -Wdangling-alias")
 endif()
 if(BISON_VERSION VERSION_GREATER_EQUAL "3.6")
   set(BISON_FLAGS "${BISON_FLAGS} -Dparse.error=detailed")
 else()
   set(BISON_FLAGS "${BISON_FLAGS} -Dparse.error=verbose")
 endif()
+if(BISON_VERSION VERSION_GREATER_EQUAL "3.7")
+  set(BISON_FLAGS "${BISON_FLAGS} -Wcounterexamples")
+endif()
 
-BISON_TARGET(ASM_PARSER "asm/parser.y"
-             "${PROJECT_SOURCE_DIR}/src/asm/parser.cpp"
-             COMPILE_FLAGS "${BISON_FLAGS}"
-             DEFINES_FILE "${PROJECT_SOURCE_DIR}/src/asm/parser.hpp"
-             )
-
-BISON_TARGET(LINKER_SCRIPT_PARSER "link/script.y"
-             "${PROJECT_SOURCE_DIR}/src/link/script.cpp"
-             COMPILE_FLAGS "${BISON_FLAGS}"
-             DEFINES_FILE "${PROJECT_SOURCE_DIR}/src/link/script.hpp"
-             )
-
-set(rgbasm_src
-    "${BISON_ASM_PARSER_OUTPUT_SOURCE}"
+bison_target(asm_parser "asm/parser.y"
+             "${CMAKE_CURRENT_BINARY_DIR}/parser.cpp"
+             COMPILE_FLAGS "${BISON_FLAGS}")
+add_executable(rgbasm $<TARGET_OBJECTS:common>
+    "${BISON_asm_parser_OUTPUT_SOURCE}"
+    "asm/actions.cpp"
     "asm/charmap.cpp"
     "asm/fixpoint.cpp"
     "asm/format.cpp"
     "asm/fstack.cpp"
+    "asm/intern.cpp"
     "asm/lexer.cpp"
     "asm/macro.cpp"
     "asm/main.cpp"
@@ -48,31 +49,23 @@ set(rgbasm_src
     "asm/symbol.cpp"
     "asm/warning.cpp"
     "extern/utf8decoder.cpp"
+    "backtrace.cpp"
     "linkdefs.cpp"
     "opmath.cpp"
-    "util.cpp"
-    )
+    "verbosity.cpp"
+)
+cmake_path(GET BISON_asm_parser_OUTPUT_HEADER PARENT_PATH parser_header_dir)
+target_include_directories(rgbasm PRIVATE "${parser_header_dir}")
 
-set(rgbfix_src
-    "fix/main.cpp"
-    )
-
-set(rgbgfx_src
-    "gfx/main.cpp"
-    "gfx/pal_packing.cpp"
-    "gfx/pal_sorting.cpp"
-    "gfx/pal_spec.cpp"
-    "gfx/process.cpp"
-    "gfx/proto_palette.cpp"
-    "gfx/reverse.cpp"
-    "gfx/rgba.cpp"
-    "extern/getopt.cpp"
-    "error.cpp"
-    )
-
-set(rgblink_src
-    "${BISON_LINKER_SCRIPT_PARSER_OUTPUT_SOURCE}"
+bison_target(linker_script_parser "link/script.y"
+             "${CMAKE_CURRENT_BINARY_DIR}/script.cpp"
+             COMPILE_FLAGS "${BISON_FLAGS}")
+add_executable(rgblink $<TARGET_OBJECTS:common>
+    "${BISON_linker_script_parser_OUTPUT_SOURCE}"
     "link/assign.cpp"
+    "link/fstack.cpp"
+    "link/lexer.cpp"
+    "link/layout.cpp"
     "link/main.cpp"
     "link/object.cpp"
     "link/output.cpp"
@@ -80,35 +73,83 @@ set(rgblink_src
     "link/sdas_obj.cpp"
     "link/section.cpp"
     "link/symbol.cpp"
+    "link/warning.cpp"
     "extern/utf8decoder.cpp"
+    "backtrace.cpp"
     "linkdefs.cpp"
     "opmath.cpp"
-    "util.cpp"
-    )
+    "verbosity.cpp"
+)
+cmake_path(GET BISON_linker_script_parser_OUTPUT_HEADER PARENT_PATH parser_header_dir)
+target_include_directories(rgblink PRIVATE "${parser_header_dir}")
 
-foreach(PROG "asm" "fix" "gfx" "link")
-  add_executable(rgb${PROG}
-                 ${rgb${PROG}_src}
-                 ${common_src}
-                 )
-  if(SUFFIX)
-    set_target_properties(rgb${PROG} PROPERTIES SUFFIX ${SUFFIX})
+add_executable(rgbfix $<TARGET_OBJECTS:common>
+    "fix/fix.cpp"
+    "fix/main.cpp"
+    "fix/mbc.cpp"
+    "fix/warning.cpp"
+)
+
+add_executable(rgbgfx $<TARGET_OBJECTS:common>
+    "gfx/color_set.cpp"
+    "gfx/main.cpp"
+    "gfx/pal_packing.cpp"
+    "gfx/pal_sorting.cpp"
+    "gfx/pal_spec.cpp"
+    "gfx/palette.cpp"
+    "gfx/png.cpp"
+    "gfx/process.cpp"
+    "gfx/reverse.cpp"
+    "gfx/rgba.cpp"
+    "gfx/warning.cpp"
+    "verbosity.cpp"
+)
+
+install(TARGETS rgbasm rgblink rgbfix rgbgfx RUNTIME COMPONENT binaries)
+# Tests expect the binaries to end up in-source; this is more acceptable than the entire artifact dir.
+set_target_properties(rgbasm rgblink rgbfix rgbgfx PROPERTIES
+# The generator expression (even if a no-op) stops muti-config generators using a of "per-configuration subdirectory".
+                      RUNTIME_OUTPUT_DIRECTORY $<1:${CMAKE_CURRENT_SOURCE_DIR}/..>)
+target_link_libraries(rgbgfx PRIVATE PNG::PNG)
+# Copy the DLLs in the output directory so the program can be run for testing without having to `install`.
+# From https://cmake.org/cmake/help/v4.3/manual/cmake-generator-expressions.7.html#genex:TARGET_RUNTIME_DLLS.
+add_custom_command(TARGET rgbgfx POST_BUILD COMMENT "Copying rgbgfx's DLLs"
+                   # It would be nice to symlink instead, but that only supports one file at a time.
+                   COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:rgbgfx> $<TARGET_RUNTIME_DLLS:rgbgfx>
+                   COMMAND_EXPAND_LISTS VERBATIM)
+
+if(WIN32)
+  # CMake 3.27 is required for `$<INSTALL_PREFIX>`, but is only needed when cross-compiling for MinGW.
+  if(CMAKE_VERSION VERSION_LESS "3.27")
+    message(WARNING "CMake 3.27 or higher is required for `\$<INSTALL_PREFIX>` inside `install(CODE)`")
   endif()
-  install(TARGETS rgb${PROG} RUNTIME DESTINATION bin)
-endforeach()
-
-if(LIBPNG_FOUND) # pkg-config
-  target_include_directories(rgbgfx PRIVATE ${LIBPNG_INCLUDE_DIRS})
-  target_link_directories(rgbgfx PRIVATE ${LIBPNG_LIBRARY_DIRS})
-  target_link_libraries(rgbgfx PRIVATE ${LIBPNG_LIBRARIES})
-else()
-  target_compile_definitions(rgbgfx PRIVATE ${PNG_DEFINITIONS})
-  target_include_directories(rgbgfx PRIVATE ${PNG_INCLUDE_DIRS})
-  target_link_libraries(rgbgfx PRIVATE ${PNG_LIBRARIES})
-endif()
-
-include(CheckLibraryExists)
-check_library_exists("m" "sin" "" HAS_LIBM)
-if(HAS_LIBM)
-  target_link_libraries(rgbasm PRIVATE "m")
+  # On Windows, you don't link against DLLs directly, but against an import library for that DLL.
+  # This leads to, sometimes, the DLL being stored in a directory far away from the import library itself!
+  set(DLL_SEARCH_DIRS CACHE PATH "List of directories in which DLLs will be searched")
+  cmake_path(CONVERT "${DLL_SEARCH_DIRS}" TO_CMAKE_PATH_LIST search_dirs NORMALIZE)
+  # TODO: we've only tested this with MinGW, but it may not work with other uses of the variable.
+  #       Anyone who knows how to handle this better, feel free to submit a patch!
+  if(DEFINED CMAKE_FIND_ROOT_PATH)
+    list(APPEND search_dirs "${CMAKE_FIND_ROOT_PATH}/bin")
+  endif()
+  # Escape the search paths in a form that makes them suitable for splatting into the CMake install script.
+  list(TRANSFORM search_dirs REPLACE "([\\$\"])" "\\\\1") # Neutralize escapes and variable refs...
+  list(TRANSFORM search_dirs REPLACE "^(.+)\$" "\"\\1\"") # ...and quote each argument.
+  list(JOIN search_dirs " " search_dirs_splat)
+  # This is a modified version of the install code generated by
+  # `install(TARGETS rgbgfx RUNTIME_DEPENDENCIES)`.
+  # Unfortunately, that `install(TARGETS)` is outright not supported when cross-compiling,
+  # and working around that has CMake fail to resolve the DLL locations with MinGW,
+  # due to not specifying any `DIRECTORIES` and the system search path being ineffective.
+  install(CODE "\
+  file(GET_RUNTIME_DEPENDENCIES
+      RESOLVED_DEPENDENCIES_VAR rgbgfx_deps
+      EXECUTABLES \"$<TARGET_FILE:rgbgfx>\"
+      DIRECTORIES ${search_dirs_splat} \"$<TARGET_FILE_DIR:ZLIB::ZLIB>\" \"$<TARGET_FILE_DIR:PNG::PNG>\"
+      PRE_EXCLUDE_REGEXES \"^kernel32\\\\.dll$\" \"^msvcrt.?.?\\\\.dll\" \"^api-ms-win-.*\\\\.dll$\")
+    foreach(rgbgfx_dep IN LISTS rgbgfx_deps)
+      file(INSTALL DESTINATION \"$<INSTALL_PREFIX>/${CMAKE_INSTALL_BINDIR}\" TYPE SHARED_LIBRARY FILES \${rgbgfx_dep}
+        FOLLOW_SYMLINK_CHAIN)
+    endforeach()"
+          COMPONENT shared-libs EXCLUDE_FROM_ALL) # Most platforms install those separately.
 endif()

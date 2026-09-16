@@ -7,19 +7,22 @@ _rgblink_completions() {
 	# Empty long opt = it doesn't exit
 	# See the `state` variable below for info about `state_after`
 	declare -A opts=(
+		[h]="help:normal"
 		[V]="version:normal"
-		[d]="dmg:normal"
-		[t]="tiny:normal"
-		[v]="verbose:normal"
-		[w]="wramx:normal"
-		[x]="nopad:normal"
-		[l]="linkerscript:glob-*"
+		[W]="warning:warning"
 		[M]="no-sym-in-map:normal"
+		[d]="dmg:normal"
+		[B]="backtrace:unk"
+		[l]="linkerscript:glob-*"
 		[m]="map:glob-*.map"
 		[n]="sym:glob-*.sym"
 		[O]="overlay:glob-*.gb *.gbc *.sgb"
 		[o]="output:glob-*.gb *.gbc *.sgb"
 		[p]="pad:unk"
+		[t]="tiny:normal"
+		[v]="verbose:normal"
+		[w]="wramx:normal"
+		[x]="nopad:normal"
 	)
 	# Parse command-line up to current word
 	local opt_ena=true
@@ -134,6 +137,19 @@ _rgblink_completions() {
 	COMPREPLY=()
 	case "$state" in
 		unk) # Return with no replies: no idea what to complete!
+			;;
+		warning)
+			mapfile -t COMPREPLY < <(compgen -W "
+				assert
+				div
+				large-constant
+				obsolete
+				shift
+				shift-amount
+				truncation
+				all
+				everything
+				error" -P "${cur_word:0:$optlen}" -- "${cur_word:$optlen}")
 			;;
 		normal) # Acts like a glob...
 			state="glob-*.o *.obj"

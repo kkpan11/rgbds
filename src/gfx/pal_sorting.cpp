@@ -1,36 +1,27 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #include "gfx/pal_sorting.hpp"
 
 #include <algorithm>
+#include <array>
+#include <optional>
+#include <stdint.h>
+#include <vector>
 
 #include "helpers.hpp"
+#include "verbosity.hpp"
 
-#include "gfx/main.hpp"
+#include "gfx/palette.hpp"
+#include "gfx/rgba.hpp"
 
-namespace sorting {
-
-void indexed(
-    std::vector<Palette> &palettes,
-    int palSize,
-    png_color const *palRGB,
-    int palAlphaSize,
-    png_byte *palAlpha
-) {
-	options.verbosePrint(Options::VERB_LOG_ACT, "Sorting palettes using embedded palette...\n");
-
-	auto pngToRgb = [&palRGB, &palAlphaSize, &palAlpha](int index) {
-		auto const &c = palRGB[index];
-		return Rgba(
-		    c.red, c.green, c.blue, palAlpha && index < palAlphaSize ? palAlpha[index] : 0xFF
-		);
-	};
+void sortIndexed(std::vector<Palette> &palettes, std::vector<Rgba> const &embPal) {
+	verbosePrint(VERB_NOTICE, "Sorting palettes using embedded palette...\n");
 
 	for (Palette &pal : palettes) {
 		std::sort(RANGE(pal), [&](uint16_t lhs, uint16_t rhs) {
 			// Iterate through the PNG's palette, looking for either of the two
-			for (int i = 0; i < palSize; ++i) {
-				uint16_t color = pngToRgb(i).cgbColor();
+			for (Rgba const &rgba : embPal) {
+				uint16_t color = rgba.cgbColor();
 				if (color == Rgba::transparent) {
 					continue;
 				}
@@ -42,15 +33,15 @@ void indexed(
 					return true;
 				}
 			}
-			unreachable_(); // This should not be possible
+			unreachable_(); // LCOV_EXCL_LINE
 		});
 	}
 }
 
-void grayscale(
-    std::vector<Palette> &palettes, std::array<std::optional<Rgba>, 0x8001> const &colors
+void sortGrayscale(
+    std::vector<Palette> &palettes, std::array<std::optional<Rgba>, NB_COLOR_SLOTS> const &colors
 ) {
-	options.verbosePrint(Options::VERB_LOG_ACT, "Sorting grayscale-only palette...\n");
+	verbosePrint(VERB_NOTICE, "Sorting palette by grayscale bins...\n");
 
 	// This method is only applicable if there are at most as many colors as colors per palette, so
 	// we should only have a single palette.
@@ -58,7 +49,7 @@ void grayscale(
 
 	Palette &palette = palettes[0];
 	std::fill(RANGE(palette.colors), Rgba::transparent);
-	for (auto const &slot : colors) {
+	for (std::optional<Rgba> const &slot : colors) {
 		if (!slot.has_value() || slot->isTransparent()) {
 			continue;
 		}
@@ -66,21 +57,20 @@ void grayscale(
 	}
 }
 
-static unsigned int legacyLuminance(uint16_t color) {
+static unsigned int luminance(uint16_t color) {
 	uint8_t red = color & 0b11111;
 	uint8_t green = color >> 5 & 0b11111;
-	uint8_t blue = color >> 10;
+	uint8_t blue = color >> 10 & 0b11111;
 	return 2126 * red + 7152 * green + 722 * blue;
 }
 
-void rgb(std::vector<Palette> &palettes) {
-	options.verbosePrint(Options::VERB_LOG_ACT, "Sorting palettes by \"\"\"luminance\"\"\"...\n");
+void sortRgb(std::vector<Palette> &palettes) {
+	verbosePrint(VERB_NOTICE, "Sorting palettes by luminance...\n");
 
 	for (Palette &pal : palettes) {
+		// Sort from lightest to darkest
 		std::sort(RANGE(pal), [](uint16_t lhs, uint16_t rhs) {
-			return legacyLuminance(lhs) > legacyLuminance(rhs);
+			return luminance(lhs) > luminance(rhs);
 		});
 	}
 }
-
-} // namespace sorting

@@ -1,24 +1,16 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_GFX_PAL_PACKING_HPP
 #define RGBDS_GFX_PAL_PACKING_HPP
 
-#include <tuple>
+#include <stddef.h>
+#include <utility>
 #include <vector>
 
-#include "defaultinitalloc.hpp"
-
 struct Palette;
-class ProtoPalette;
+class ColorSet;
 
-namespace packing {
-
-/*
- * Returns which palette each proto-palette maps to, and how many palettes are necessary
- */
-std::tuple<DefaultInitVec<size_t>, size_t>
-    overloadAndRemove(std::vector<ProtoPalette> const &protoPalettes);
-
-} // namespace packing
+// Returns which palette each color set maps to, and how many palettes are necessary
+std::pair<std::vector<size_t>, size_t> overloadAndRemove(std::vector<ColorSet> const &colorSets);
 
 #endif // RGBDS_GFX_PAL_PACKING_HPP

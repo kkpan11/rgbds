@@ -1,6 +1,4 @@
-/* SPDX-License-Identifier: MIT */
-
-// platform-specific hacks
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_PLATFORM_HPP
 #define RGBDS_PLATFORM_HPP
@@ -30,6 +28,7 @@
 	#define STDERR_FILENO 2
 	#define ssize_t       int
 	#define SSIZE_MAX     INT_MAX
+	#define isatty        _isatty
 #else
 	#include <fcntl.h>  // IWYU pragma: export
 	#include <limits.h> // IWYU pragma: export
@@ -54,6 +53,17 @@
 	#define setmode(fd, mode) _setmode(fd, mode)
 #else
 	#define setmode(fd, mode) (0)
+#endif
+
+// Windows has 32-bit `long`, which limits `fseek` and `ftell` to 2 GiB
+#if defined(_MSC_VER) || defined(__MINGW32__)
+	#define fseek _fseeki64
+	#define ftell _ftelli64
+#endif
+
+// MingGW and Cygwin may need POSIX functions which are not standard C explicitly enabled
+#if (defined(__MINGW32__) || defined(__CYGWIN__)) && !defined(_POSIX_C_SOURCE)
+	#define _POSIX_C_SOURCE 200809L
 #endif
 
 #endif // RGBDS_PLATFORM_HPP

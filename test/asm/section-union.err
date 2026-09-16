@@ -1,4 +1,2 @@
-error: section-union.asm(37):
-    Section already declared as union section
-FATAL: section-union.asm(37):
-    Cannot create section "test" (1 error)
+FATAL: Section "test" already declared as `SECTION UNION`
+    at section-union.asm(37)

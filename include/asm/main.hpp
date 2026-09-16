@@ -1,18 +1,50 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_ASM_MAIN_HPP
 #define RGBDS_ASM_MAIN_HPP
 
+#include <optional>
+#include <stdint.h>
 #include <stdio.h>
 #include <string>
 
-extern bool verbose;
-extern bool warnings; // True to enable warnings, false to disable them.
+#include "helpers.hpp" // assume
+#include "util.hpp"    // xfclose
 
-extern FILE *dependFile;
-extern std::string targetFileName;
-extern bool generatedMissingIncludes;
-extern bool failedOnMissingInclude;
-extern bool generatePhonyDeps;
+enum MissingInclude {
+	INC_ERROR,    // A missing included file is an error that halts assembly
+	GEN_EXIT,     // A missing included file is assumed to be generated; exit normally
+	GEN_CONTINUE, // A missing included file is assumed to be generated; continue assembling
+};
+
+struct Options {
+	bool exportAll = false;                         // -E
+	uint8_t fixPrecision = 16;                      // -Q
+	size_t maxRecursionDepth = 64;                  // -r
+	char binDigits[2] = {'0', '1'};                 // -b
+	char gfxDigits[4] = {'0', '1', '2', '3'};       // -g
+	FILE *dependFile = nullptr;                     // -M
+	std::optional<std::string> targetFileName{};    // -MQ, -MT
+	MissingInclude missingIncludeState = INC_ERROR; // -MC, -MG
+	bool generatePhonyDeps = false;                 // -MP
+	std::optional<std::string> objectFileName{};    // -o
+	uint8_t padByte = 0;                            // -p
+	uint64_t maxErrors = 0;                         // -X
+
+	~Options() {
+		if (dependFile) {
+			xfclose(dependFile);
+		}
+	}
+
+	void printDep(std::string const &depName) {
+		if (dependFile) {
+			assume(targetFileName.has_value());
+			fprintf(dependFile, "%s: %s\n", targetFileName->c_str(), depName.c_str());
+		}
+	}
+};
+
+extern Options options;
 
 #endif // RGBDS_ASM_MAIN_HPP

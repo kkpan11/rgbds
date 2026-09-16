@@ -1,20 +1,31 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #include "asm/fstack.hpp"
 #include <sys/stat.h>
 
+#include <deque>
 #include <errno.h>
 #include <inttypes.h>
 #include <memory>
+#include <optional>
 #include <stack>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "error.hpp"
+#include "backtrace.hpp"
 #include "helpers.hpp"
+#include "itertools.hpp" // reversed
 #include "linkdefs.hpp"
-#include "platform.hpp" // S_ISDIR (stat macro)
+#include "platform.hpp" // strncasecmp
+#include "verbosity.hpp"
 
+#include "asm/intern.hpp"
 #include "asm/lexer.hpp"
 #include "asm/macro.hpp"
 #include "asm/main.hpp"
@@ -37,68 +48,91 @@ struct Context {
 	bool isForLoop = false;
 	int32_t forValue = 0;
 	int32_t forStep = 0;
-	std::string forName{};
+	InternedStr forName{};
 };
 
 static std::stack<Context> contextStack;
-size_t maxRecursionDepth;
 
 // The first include path for `fstk_FindFile` to try is none at all
-static std::vector<std::string> includePaths = {""};
+static std::vector<std::string> includePaths = {""}; // -I
+static std::deque<std::string> preIncludeStack;      // -P
+static bool failedOnMissingInclude = false;
 
-static std::string preIncludeName;
-
-std::vector<uint32_t> &FileStackNode::iters() {
-	assume(std::holds_alternative<std::vector<uint32_t>>(data));
-	return std::get<std::vector<uint32_t>>(data);
-}
-
-std::vector<uint32_t> const &FileStackNode::iters() const {
-	assume(std::holds_alternative<std::vector<uint32_t>>(data));
-	return std::get<std::vector<uint32_t>>(data);
-}
-
-std::string &FileStackNode::name() {
-	assume(std::holds_alternative<std::string>(data));
-	return std::get<std::string>(data);
-}
-
-std::string const &FileStackNode::name() const {
-	assume(std::holds_alternative<std::string>(data));
-	return std::get<std::string>(data);
-}
-
-std::string const &FileStackNode::dump(uint32_t curLineNo) const {
-	if (std::holds_alternative<std::vector<uint32_t>>(data)) {
-		assume(parent); // REPT nodes use their parent's name
-		std::string const &lastName = parent->dump(lineNo);
-		fputs(" -> ", stderr);
-		fputs(lastName.c_str(), stderr);
-		std::vector<uint32_t> const &nodeIters = iters();
-		for (uint32_t i = nodeIters.size(); i--;) {
-			fprintf(stderr, "::REPT~%" PRIu32, nodeIters[i]);
+void FileStackNode::printBacktrace(uint32_t curLineNo) const {
+	using TraceItem = std::pair<FileStackNode const *, uint32_t>;
+	std::vector<TraceItem> items;
+	for (TraceItem item{this, curLineNo};;) {
+		auto &[node, itemLineNo] = item;
+		bool loud = !node->isQuiet || tracing.loud;
+		if (loud) {
+			items.emplace_back(node, itemLineNo);
 		}
-		fprintf(stderr, "(%" PRIu32 ")", curLineNo);
-		return lastName;
-	} else {
-		if (parent) {
-			parent->dump(lineNo);
-			fputs(" -> ", stderr);
+		if (!node->parent) {
+			assume(node->type != NODE_REPT && std::holds_alternative<std::string>(node->data));
+			break;
 		}
-		std::string const &nodeName = name();
-		fputs(nodeName.c_str(), stderr);
-		fprintf(stderr, "(%" PRIu32 ")", curLineNo);
-		return nodeName;
+		if (loud || node->type != NODE_REPT) {
+			// Quiet REPT nodes will pass their interior line number up to their parent,
+			// which is more precise than the parent's own line number (since that will be
+			// the line number of the "REPT?" or "FOR?" itself).
+			itemLineNo = node->lineNo;
+		}
+		node = &*node->parent;
+	}
+
+	using TraceNode = std::pair<std::string, uint32_t>;
+	std::vector<TraceNode> traceNodes;
+	traceNodes.reserve(items.size());
+	for (auto &[node, itemLineNo] : reversed(items)) {
+		if (std::holds_alternative<std::vector<uint32_t>>(node->data)) {
+			assume(!traceNodes.empty()); // REPT nodes use their parent's name
+			std::string reptName = traceNodes.back().first;
+			if (std::vector<uint32_t> const &nodeIters = node->iters(); !nodeIters.empty()) {
+				reptName.append(NODE_SEPARATOR REPT_NODE_PREFIX);
+				reptName.append(std::to_string(nodeIters.front()));
+			}
+			traceNodes.emplace_back(reptName, itemLineNo);
+		} else {
+			traceNodes.emplace_back(node->name(), itemLineNo);
+		}
+	}
+
+	trace_PrintBacktrace(
+	    traceNodes,
+	    [](TraceNode const &node) { return node.first.c_str(); },
+	    [](TraceNode const &node) { return node.second; }
+	);
+}
+
+void fstk_TraceCurrent() {
+	if (!lexer_AtTopLevel()) {
+		assume(!contextStack.empty());
+		contextStack.top().fileInfo->printBacktrace(lexer_GetLineNo());
+	}
+	lexer_TraceStringExpansions();
+}
+
+// LCOV_EXCL_START
+void fstk_VerboseOutputConfig() {
+	assume(checkVerbosity(VERB_CONFIG));
+	// -I/--include
+	if (includePaths.size() > 1) {
+		fputs("\tInclude file paths:\n", stderr);
+		for (std::string const &path : includePaths) {
+			if (!path.empty()) {
+				fprintf(stderr, "\t - %s\n", path.c_str());
+			}
+		}
+	}
+	// -P/--preinclude
+	if (!preIncludeStack.empty()) {
+		fputs("\tPreincluded files:\n", stderr);
+		for (std::string const &name : preIncludeStack) {
+			fprintf(stderr, "\t - %s\n", name.c_str());
+		}
 	}
 }
-
-void fstk_DumpCurrent() {
-	if (contextStack.empty()) {
-		fputs("at top level", stderr);
-		return;
-	}
-	contextStack.top().fileInfo->dump(lexer_GetLineNo());
-}
+// LCOV_EXCL_STOP
 
 std::shared_ptr<FileStackNode> fstk_GetFileStack() {
 	return contextStack.empty() ? nullptr : contextStack.top().fileInfo;
@@ -110,8 +144,9 @@ std::shared_ptr<std::string> fstk_GetUniqueIDStr() {
 	std::shared_ptr<std::string> &str = contextStack.top().uniqueIDStr;
 
 	// If a unique ID is allowed but has not been generated yet, generate one now.
-	if (str && str->empty())
+	if (str && str->empty()) {
 		*str = "_u"s + std::to_string(nextUniqueID++);
+	}
 
 	return str;
 }
@@ -123,33 +158,30 @@ MacroArgs *fstk_GetCurrentMacroArgs() {
 }
 
 void fstk_AddIncludePath(std::string const &path) {
-	if (path.empty())
+	if (path.empty()) {
 		return;
+	}
 
 	std::string &includePath = includePaths.emplace_back(path);
-	if (includePath.back() != '/')
+	if (includePath.back() != '/') {
 		includePath += '/';
-}
-
-void fstk_SetPreIncludeFile(std::string const &path) {
-	if (!preIncludeName.empty())
-		warnx("Overriding pre-included filename %s", preIncludeName.c_str());
-	preIncludeName = path;
-	if (verbose)
-		printf("Pre-included filename %s\n", preIncludeName.c_str());
-}
-
-static void printDep(std::string const &path) {
-	if (dependFile) {
-		fprintf(dependFile, "%s: %s\n", targetFileName.c_str(), path.c_str());
-		if (generatePhonyDeps)
-			fprintf(dependFile, "%s:\n", path.c_str());
 	}
+}
+
+void fstk_AddPreIncludeFile(std::string const &path) {
+	preIncludeStack.emplace_front(path);
 }
 
 static bool isValidFilePath(std::string const &path) {
 	struct stat statBuf;
 	return stat(path.c_str(), &statBuf) == 0 && !S_ISDIR(statBuf.st_mode); // Reject directories
+}
+
+static void printDep(std::string const &path) {
+	options.printDep(path);
+	if (options.dependFile && options.generatePhonyDeps && isValidFilePath(path)) {
+		fprintf(options.dependFile, "%s:\n", path.c_str());
+	}
 }
 
 std::optional<std::string> fstk_FindFile(std::string const &path) {
@@ -160,21 +192,28 @@ std::optional<std::string> fstk_FindFile(std::string const &path) {
 		}
 	}
 
-	errno = ENOENT;
-	if (generatedMissingIncludes)
+	if (options.missingIncludeState != INC_ERROR) {
 		printDep(path);
+	}
+
+	// Set `errno` as if `fopen` had failed on a nonexistent file.
+	// This allows a subsequent `fstk_FileError` to report correctly with `strerror`.
+	errno = ENOENT;
+
 	return std::nullopt;
 }
 
 bool yywrap() {
 	uint32_t ifDepth = lexer_GetIFDepth();
 
-	if (ifDepth != 0)
-		fatalerror(
-		    "Ended block with %" PRIu32 " unterminated IF construct%s\n",
+	if (ifDepth != 0) {
+		fatal(
+		    "Ended block with %" PRIu32 " unterminated conditional%s (`IF`/`ELIF`/`ELSE` block%s)",
 		    ifDepth,
+		    ifDepth == 1 ? "" : "s",
 		    ifDepth == 1 ? "" : "s"
 		);
+	}
 
 	if (Context &context = contextStack.top(); context.fileInfo->type == NODE_REPT) {
 		// The context is a REPT or FOR block, which may loop
@@ -182,7 +221,7 @@ bool yywrap() {
 		// If the node is referenced outside this context, we can't edit it, so duplicate it
 		if (context.fileInfo.use_count() > 1) {
 			context.fileInfo = std::make_shared<FileStackNode>(*context.fileInfo);
-			context.fileInfo->ID = -1; // The copy is not yet registered
+			context.fileInfo->ID = UINT32_MAX; // The copy is not yet registered
 		}
 
 		std::vector<uint32_t> &fileInfoIters = context.fileInfo->iters();
@@ -190,16 +229,19 @@ bool yywrap() {
 		// If this is a FOR, update the symbol value
 		if (context.isForLoop && fileInfoIters.front() <= context.nbReptIters) {
 			// Avoid arithmetic overflow runtime error
-			uint32_t forValue = (uint32_t)context.forValue + (uint32_t)context.forStep;
-			context.forValue = forValue <= INT32_MAX ? forValue : -(int32_t)~forValue - 1;
+			uint32_t forValue =
+			    static_cast<uint32_t>(context.forValue) + static_cast<uint32_t>(context.forStep);
+			context.forValue =
+			    forValue <= INT32_MAX ? forValue : -static_cast<int32_t>(~forValue) - 1;
 			Symbol *sym = sym_AddVar(context.forName, context.forValue);
 
 			// This error message will refer to the current iteration
-			if (sym->type != SYM_VAR)
-				fatalerror("Failed to update FOR symbol value\n");
+			if (sym->type != SYM_VAR) {
+				fatal("Failed to update `FOR` symbol value");
+			}
 		}
 		// Advance to the next iteration
-		fileInfoIters.front()++;
+		++fileInfoIters.front();
 		// If this wasn't the last iteration, wrap instead of popping
 		if (fileInfoIters.front() <= context.nbReptIters) {
 			lexer_RestartRept(context.fileInfo->lineNo);
@@ -217,18 +259,19 @@ bool yywrap() {
 }
 
 static void checkRecursionDepth() {
-	if (contextStack.size() > maxRecursionDepth)
-		fatalerror("Recursion limit (%zu) exceeded\n", maxRecursionDepth);
+	if (contextStack.size() > options.maxRecursionDepth) {
+		fatal("Recursion limit (%zu) exceeded", options.maxRecursionDepth);
+	}
 }
 
-static bool newFileContext(std::string const &filePath, bool updateStateNow) {
+static void newFileContext(std::string const &filePath, bool isQuiet, bool updateStateNow) {
 	checkRecursionDepth();
 
 	std::shared_ptr<std::string> uniqueIDStr = nullptr;
 	std::shared_ptr<MacroArgs> macroArgs = nullptr;
 
 	auto fileInfo =
-	    std::make_shared<FileStackNode>(NODE_MACRO, filePath == "-" ? "<stdin>" : filePath);
+	    std::make_shared<FileStackNode>(NODE_FILE, filePath == "-" ? "<stdin>" : filePath, isQuiet);
 	if (!contextStack.empty()) {
 		Context &oldContext = contextStack.top();
 		fileInfo->parent = oldContext.fileInfo;
@@ -243,10 +286,11 @@ static bool newFileContext(std::string const &filePath, bool updateStateNow) {
 	    .macroArgs = macroArgs,
 	});
 
-	return context.lexerState.setFileAsNextState(filePath, updateStateNow);
+	context.lexerState.setFileAsNextState(filePath, updateStateNow);
 }
 
-static void newMacroContext(Symbol const &macro, std::shared_ptr<MacroArgs> macroArgs) {
+static void
+    newMacroContext(Symbol const &macro, std::shared_ptr<MacroArgs> macroArgs, bool isQuiet) {
 	checkRecursionDepth();
 
 	Context &oldContext = contextStack.top();
@@ -260,15 +304,15 @@ static void newMacroContext(Symbol const &macro, std::shared_ptr<MacroArgs> macr
 	}
 	if (macro.src->type == NODE_REPT) {
 		std::vector<uint32_t> const &srcIters = macro.src->iters();
-		for (uint32_t i = srcIters.size(); i--;) {
-			fileInfoName.append("::REPT~");
-			fileInfoName.append(std::to_string(srcIters[i]));
+		for (uint32_t iter : reversed(srcIters)) {
+			fileInfoName.append(NODE_SEPARATOR REPT_NODE_PREFIX);
+			fileInfoName.append(std::to_string(iter));
 		}
 	}
-	fileInfoName.append("::");
-	fileInfoName.append(macro.name);
+	fileInfoName.append(NODE_SEPARATOR);
+	fileInfoName.append(macro.name.str());
 
-	auto fileInfo = std::make_shared<FileStackNode>(NODE_MACRO, fileInfoName);
+	auto fileInfo = std::make_shared<FileStackNode>(NODE_MACRO, fileInfoName, isQuiet);
 	assume(!contextStack.empty()); // The top level context cannot be a MACRO
 	fileInfo->parent = oldContext.fileInfo;
 	fileInfo->lineNo = lexer_GetLineNo();
@@ -282,7 +326,8 @@ static void newMacroContext(Symbol const &macro, std::shared_ptr<MacroArgs> macr
 	context.lexerState.setViewAsNextState("MACRO", macro.getMacro(), macro.fileLine);
 }
 
-static Context &newReptContext(int32_t reptLineNo, ContentSpan const &span, uint32_t count) {
+static Context &
+    newReptContext(int32_t reptLineNo, ContentSpan const &span, uint32_t count, bool isQuiet) {
 	checkRecursionDepth();
 
 	Context &oldContext = contextStack.top();
@@ -293,7 +338,7 @@ static Context &newReptContext(int32_t reptLineNo, ContentSpan const &span, uint
 		fileInfoIters.insert(fileInfoIters.end(), RANGE(oldContext.fileInfo->iters()));
 	}
 
-	auto fileInfo = std::make_shared<FileStackNode>(NODE_REPT, fileInfoIters);
+	auto fileInfo = std::make_shared<FileStackNode>(NODE_REPT, fileInfoIters, isQuiet);
 	assume(!contextStack.empty()); // The top level context cannot be a REPT
 	fileInfo->parent = oldContext.fileInfo;
 	fileInfo->lineNo = reptLineNo;
@@ -311,106 +356,153 @@ static Context &newReptContext(int32_t reptLineNo, ContentSpan const &span, uint
 	return context;
 }
 
-void fstk_RunInclude(std::string const &path, bool preInclude) {
-	std::optional<std::string> fullPath = fstk_FindFile(path);
-
-	if (!fullPath) {
-		if (generatedMissingIncludes && !preInclude) {
-			if (verbose)
-				printf("Aborting (-MG) on INCLUDE file '%s' (%s)\n", path.c_str(), strerror(errno));
-			failedOnMissingInclude = true;
-		} else {
-			error("Unable to open included file '%s': %s\n", path.c_str(), strerror(errno));
+bool fstk_FileError(std::string const &path, char const *description) {
+	if (options.missingIncludeState == INC_ERROR) {
+		error("Error opening %s file \"%s\": %s", description, path.c_str(), strerror(errno));
+	} else {
+		failedOnMissingInclude = true;
+		// LCOV_EXCL_START
+		if (options.missingIncludeState == GEN_EXIT) {
+			verbosePrint(
+			    VERB_NOTICE,
+			    "Aborting due to '-MG' on %s file \"%s\": %s\n",
+			    description,
+			    path.c_str(),
+			    strerror(errno)
+			);
+			return true;
 		}
-		return;
+		assume(options.missingIncludeState == GEN_CONTINUE);
+		// LCOV_EXCL_STOP
 	}
-
-	if (!newFileContext(*fullPath, false))
-		fatalerror("Failed to set up lexer for file include\n");
+	return false;
 }
 
-void fstk_RunMacro(std::string const &macroName, std::shared_ptr<MacroArgs> macroArgs) {
-	Symbol *macro = sym_FindExactSymbol(macroName);
-
-	if (!macro) {
-		error("Macro \"%s\" not defined\n", macroName.c_str());
-		return;
-	}
-	if (macro->type != SYM_MACRO) {
-		error("\"%s\" is not a macro\n", macroName.c_str());
-		return;
-	}
-
-	newMacroContext(*macro, macroArgs);
+bool fstk_FailedOnMissingInclude() {
+	return failedOnMissingInclude;
 }
 
-void fstk_RunRept(uint32_t count, int32_t reptLineNo, ContentSpan const &span) {
-	if (count == 0)
-		return;
+bool fstk_RunInclude(std::string const &path, bool isQuiet) {
+	if (std::optional<std::string> fullPath = fstk_FindFile(path); fullPath) {
+		newFileContext(*fullPath, isQuiet, false);
+		return false;
+	}
+	return fstk_FileError(path, "`INCLUDE`");
+}
 
-	newReptContext(reptLineNo, span, count);
+void fstk_RunMacro(InternedStr macroName, std::shared_ptr<MacroArgs> macroArgs, bool isQuiet) {
+	auto makeSuggestion = [&macroName, &macroArgs]() -> std::optional<std::string> {
+		std::shared_ptr<std::string> arg = macroArgs->getArg(1);
+		if (!arg) {
+			return std::nullopt;
+		}
+
+		char const *str = arg->c_str();
+		static char const *types[] = {"EQUS", "EQU", "RB", "RW", "RL", "="};
+		for (char const *type : types) {
+			if (strncasecmp(str, type, strlen(type)) == 0) {
+				return "\"DEF "s + macroName.str() + " " + type + " ...\"";
+			}
+		}
+		if (strncasecmp(str, "SET", literal_strlen("SET")) == 0) {
+			return "\"DEF "s + macroName.str() + " = ...\"";
+		}
+		if (str[0] == ':') {
+			return "a label \""s + macroName.str() + (str[1] == ':' ? "::" : ":") + "\"";
+		}
+
+		return std::nullopt;
+	};
+
+	if (Symbol *macro = sym_FindExactSymbol(macroName); !macro) {
+		if (sym_IsPurgedExact(macroName)) {
+			error("Undefined macro `%s`; it was purged", macroName.c_str());
+		} else if (std::optional<std::string> suggestion = makeSuggestion(); suggestion) {
+			error(
+			    "Undefined macro `%s` (did you mean %s?)", macroName.c_str(), suggestion->c_str()
+			);
+		} else {
+			error("Undefined macro `%s`", macroName.c_str());
+		}
+	} else if (macro->type != SYM_MACRO) {
+		error("`%s` is not a macro", macroName.c_str());
+	} else {
+		newMacroContext(*macro, macroArgs, isQuiet || macro->isQuiet);
+	}
+}
+
+void fstk_RunRept(uint32_t count, int32_t reptLineNo, ContentSpan const &span, bool isQuiet) {
+	if (count) {
+		newReptContext(reptLineNo, span, count, isQuiet);
+	}
 }
 
 void fstk_RunFor(
-    std::string const &symName,
+    InternedStr symName,
     int32_t start,
     int32_t stop,
     int32_t step,
     int32_t reptLineNo,
-    ContentSpan const &span
+    ContentSpan const &span,
+    bool isQuiet
 ) {
-	if (Symbol *sym = sym_AddVar(symName, start); sym->type != SYM_VAR)
+	if (Symbol *sym = sym_AddVar(symName, start); sym->type != SYM_VAR) {
 		return;
+	}
 
 	uint32_t count = 0;
-	if (step > 0 && start < stop)
-		count = ((int64_t)stop - start - 1) / step + 1;
-	else if (step < 0 && stop < start)
-		count = ((int64_t)start - stop - 1) / -(int64_t)step + 1;
-	else if (step == 0)
-		error("FOR cannot have a step value of 0\n");
+	if (step > 0 && start < stop) {
+		count = (static_cast<int64_t>(stop) - start - 1) / step + 1;
+	} else if (step < 0 && stop < start) {
+		count = (static_cast<int64_t>(start) - stop - 1) / -static_cast<int64_t>(step) + 1;
+	} else if (step == 0) {
+		error("`FOR` cannot have a step value of 0");
+	}
 
-	if ((step > 0 && start > stop) || (step < 0 && start < stop))
+	if ((step > 0 && start > stop) || (step < 0 && start < stop)) {
 		warning(
-		    WARNING_BACKWARDS_FOR, "FOR goes backwards from %d to %d by %d\n", start, stop, step
+		    WARNING_BACKWARDS_FOR, "`FOR` goes backwards from %d to %d by %d", start, stop, step
 		);
+	}
 
-	if (count == 0)
+	if (count == 0) {
 		return;
+	}
 
-	Context &context = newReptContext(reptLineNo, span, count);
+	Context &context = newReptContext(reptLineNo, span, count, isQuiet);
 	context.isForLoop = true;
 	context.forValue = start;
 	context.forStep = step;
 	context.forName = symName;
 }
 
-void fstk_StopRept() {
-	contextStack.top().nbReptIters = 0; // Prevent more iterations
-}
-
 bool fstk_Break() {
 	if (contextStack.top().fileInfo->type != NODE_REPT) {
-		error("BREAK can only be used inside a REPT/FOR block\n");
+		error("`BREAK` can only be used inside a loop (`REPT`/`FOR` block)");
 		return false;
 	}
 
-	fstk_StopRept();
+	contextStack.top().nbReptIters = 0; // Prevent more iterations
 	return true;
 }
 
 void fstk_NewRecursionDepth(size_t newDepth) {
-	if (contextStack.size() > newDepth + 1)
-		fatalerror("Recursion limit (%zu) exceeded\n", newDepth);
-	maxRecursionDepth = newDepth;
+	if (contextStack.size() > newDepth + 1) {
+		fatal("Recursion limit (%zu) exceeded", newDepth);
+	}
+	options.maxRecursionDepth = newDepth;
 }
 
-void fstk_Init(std::string const &mainPath, size_t maxDepth) {
-	if (!newFileContext(mainPath, true))
-		fatalerror("Failed to open main file\n");
+bool fstk_Init(std::string const &mainPath) {
+	newFileContext(mainPath, false, true);
 
-	maxRecursionDepth = maxDepth;
+	for (std::string const &name : preIncludeStack) {
+		if (std::optional<std::string> fullPath = fstk_FindFile(name); fullPath) {
+			newFileContext(*fullPath, false, false);
+		} else if (fstk_FileError(name, "pre-included")) {
+			return false;
+		}
+	}
 
-	if (!preIncludeName.empty())
-		fstk_RunInclude(preIncludeName, true);
+	return true;
 }

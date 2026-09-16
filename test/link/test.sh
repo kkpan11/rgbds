@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 
-export LC_ALL=C
 set -o pipefail
 
-[[ -e ./unmangle ]] || make -C ../.. test/link/unmangle || exit
+export LC_ALL=C
+
+# Screen width for help/usage text (for reproducible test results)
+export COLUMNS=79
+shopt -u checkwinsize # Prevent subsequent commands from resetting `COLUMNS`
 
 otemp="$(mktemp)"
 gbtemp="$(mktemp)"
 gbtemp2="$(mktemp)"
 outtemp="$(mktemp)"
 outtemp2="$(mktemp)"
+outtemp3="$(mktemp)"
+
+# shellcheck disable=SC2064 # (Immediate expansion is the desired behavior.)
+trap "rm -f ${otemp@Q} ${gbtemp@Q} ${gbtemp2@Q} ${outtemp@Q} ${outtemp2@Q} ${outtemp3@Q}" EXIT
+
 tests=0
 failed=0
 rc=0
-
-# Immediate expansion is the desired behavior.
-# shellcheck disable=SC2064
-trap "rm -f ${otemp@Q} ${gbtemp@Q} ${gbtemp2@Q} ${outtemp@Q} ${outtemp2@Q}" EXIT
 
 bold="$(tput bold)"
 resbold="$(tput sgr0)"
@@ -26,6 +30,7 @@ rescolors="$(tput op)"
 
 RGBASM=../../rgbasm
 RGBLINK=../../rgblink
+RGBFIX=../../rgbfix
 
 startTest () {
 	echo "${bold}${green}${test} assembling...${rescolors}${resbold}"
@@ -38,7 +43,7 @@ continueTest () {
 }
 
 tryDiff () {
-	if ! diff -u --strip-trailing-cr "$1" "$2"; then
+	if ! diff -au --strip-trailing-cr "$1" "$2"; then
 		echo "${bold}${red}$1 mismatch!${rescolors}${resbold}"
 		false
 	fi
@@ -53,24 +58,17 @@ tryCmp () {
 	fi
 	(( our_rc = our_rc || $? ))
 }
+
 tryCmpRom () {
 	# `printf` lets us keep only the first returned word from `wc`.
 	rom_size=$(printf %s $(wc -c <"$1"))
+	# 'rgblink -x' implies '-t', so we cannot use '-x' to trim the ROM output
 	dd if="$gbtemp" count=1 bs="$rom_size" >"$otemp" 2>/dev/null
 	tryCmp "$1" "$otemp"
 }
 
-tryCmpRomSize () {
-	rom_size=$(printf %s $(wc -c <"$1"))
-	if [ "$rom_size" -ne "$2" ]; then
-		echo "$bold${red}${test} binary size mismatch! ${rescolors}${resbold}"
-		false
-	fi
-	(( our_rc = our_rc || $? ))
-}
-
 rgblinkQuiet () {
-	out="$(env $RGBLINK "$@")" || return $?
+	out="$(env "$RGBLINK" -Weverything -Bcollapse "$@")" || return $?
 	if [[ -n "$out" ]]; then
 		echo "$bold${red}Linking shouldn't produce anything on stdout!${rescolors}${resbold}"
 		false
@@ -85,34 +83,29 @@ evaluateTest () {
 	fi
 }
 
-substPath () {
-	# Escape regex metacharacters
-	subst="$(printf '%s\n' "$1" | sed 's:[][\/.^$*]:\\&:g')"
-	# Replace the file name with a different one to match changed output
-	sed -i'' -e "s|$subst|$2|g" "$3"
-	# Escape regex metacharacters in the un-MinGW-mangled path
-	subst="$(./unmangle "$1" | sed 's:[][\/.^$*]:\\&:g')"
-	sed -i'' -e "s|$subst|$2|g" "$3"
-}
-
 for i in *.asm; do
 	test=${i%.asm}
 	startTest
 	"$RGBASM" -o "$otemp" "${test}.asm"
+
+	RGBLINKFLAGS=()
+	if [ -f "${test}.flags" ]; then
+		RGBLINKFLAGS+=("@${test}.flags")
+	fi
 
 	# Some tests have variants depending on flags
 	ran_flag=false
 	for flag in '-d' '-t' '-w'; do
 		if [ -f "${test}-no${flag}.out" ]; then
 			continueTest "-no${flag}"
-			rgblinkQuiet -o "$gbtemp" "$otemp" 2>"$outtemp"
+			rgblinkQuiet "${RGBLINKFLAGS[@]}" -o "$gbtemp" "$otemp" 2>"$outtemp"
 			tryDiff "${test}-no${flag}.out" "$outtemp"
 			evaluateTest
 			ran_flag=true
 		fi
 		if [ -f "${test}${flag}.out" ]; then
 			continueTest "$flag"
-			rgblinkQuiet ${flag} -o "$gbtemp" "$otemp" 2>"$outtemp"
+			rgblinkQuiet "${RGBLINKFLAGS[@]}" ${flag} -o "$gbtemp" "$otemp" 2>"$outtemp"
 			tryDiff "${test}${flag}.out" "$outtemp"
 			evaluateTest
 			ran_flag=true
@@ -127,7 +120,7 @@ for i in *.asm; do
 		[[ -e "$script" ]] || break # If the glob doesn't match, it just... doesn't expand!
 
 		continueTest "${script#${test}}"
-		rgblinkQuiet -l "$script" -o "$gbtemp" "$otemp" 2>"$outtemp"
+		rgblinkQuiet "${RGBLINKFLAGS[@]}" -l "$script" -o "$gbtemp" "$otemp" 2>"$outtemp"
 		tryDiff "${script%.link}.out" "$outtemp"
 		evaluateTest
 		ran_flag=true
@@ -138,7 +131,7 @@ for i in *.asm; do
 
 	# The rest of the tests just links a file, and maybe checks the binary
 	continueTest
-	rgblinkQuiet -o "$gbtemp" "$otemp" 2>"$outtemp"
+	rgblinkQuiet "${RGBLINKFLAGS[@]}" -o "$gbtemp" "$otemp" 2>"$outtemp"
 	tryDiff "${test}.out" "$outtemp"
 	bin=${test}.out.bin
 	if [ -f "$bin" ]; then
@@ -154,8 +147,30 @@ startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
-rgblinkQuiet -o "$gbtemp" "$gbtemp2" "$otemp" 2>"$outtemp"
+rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="constant-parent"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$otemp" "$gbtemp2" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+tryDiff "$test"/ref.out.sym "$outtemp2"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="export-all"
+startTest
+"$RGBASM" -E -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$otemp" "$gbtemp2" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+tryDiff "$test"/ref.out.sym "$outtemp2"
+tryCmpRom "$test"/ref.out.bin
 evaluateTest
 
 for test in fragment-align/*; do
@@ -171,6 +186,37 @@ for test in fragment-align/*; do
 	evaluateTest
 done
 
+test="fragment-literals"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -m "$outtemp" -n "$outtemp2" "$otemp"
+tryCmpRom "$test"/ref.out.bin
+tryDiff "$test"/ref.out.map "$outtemp"
+tryDiff "$test"/ref.out.sym "$outtemp2"
+evaluateTest
+
+test="jr-wraparound"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$outtemp" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$otemp" "$outtemp"
+tryCmpRom "$test"/ref.out.bin
+tryDiff "$test"/ref.out.sym "$outtemp2"
+evaluateTest
+
+test="jr-truncation"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$outtemp" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$otemp" "$outtemp" 2>"$outtemp3"
+tryDiff "$test"/out.err "$outtemp3"
+tryCmpRom "$test"/ref.out.bin
+tryDiff "$test"/ref.out.sym "$outtemp2"
+evaluateTest
+
 test="high-low"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
@@ -179,6 +225,46 @@ continueTest
 rgblinkQuiet -o "$gbtemp" "$otemp"
 rgblinkQuiet -o "$gbtemp2" "$outtemp"
 tryCmp "$gbtemp" "$gbtemp2"
+evaluateTest
+
+test="load-fragment/base"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp" "$otemp"
+tryCmpRom "$test"/ref.out.bin
+tryDiff "$test"/ref.out.sym "$outtemp"
+evaluateTest
+
+test="load-fragment/multiple-objects"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="load-fragment/section-fragment"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$outtemp" "$test"/b.asm
+"$RGBASM" -o "$outtemp2" "$test"/c.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -m "$outtemp3" -n "$gbtemp2" "$otemp" "$outtemp" "$outtemp2"
+tryCmpRom "$test"/ref.out.bin
+tryDiff "$test"/ref.out.map "$outtemp3"
+tryDiff "$test"/ref.out.sym "$gbtemp2"
+evaluateTest
+
+test="map-file"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -m "$outtemp2" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+tryDiff "$test"/ref.out.map "$outtemp2"
+tryCmpRom "$test"/ref.out.bin
 evaluateTest
 
 test="overlay/smaller"
@@ -191,6 +277,24 @@ tryDiff "$test"/out.err "$outtemp"
 tryCmp "$test"/out.gb "$gbtemp"
 evaluateTest
 
+test="overlay/smaller-32k"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -t -O "$test"/overlay.gb "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+# This test does not trim its output with 'dd' because it needs to verify the correct output size
+tryCmp "$test"/out.gb "$gbtemp"
+evaluateTest
+
+test="overlay/unfixed"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -O "$test"/overlay.gb "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
 test="overlay/tiny"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
@@ -201,23 +305,93 @@ tryDiff "$test"/out.err "$outtemp"
 tryCmp "$test"/out.gb "$gbtemp"
 evaluateTest
 
+test="pipeline"
+startTest
+continueTest
+("$RGBASM" -o - - | "$RGBLINK" -o - - | "$RGBFIX" -v -p 0xff -) < "$test"/a.asm > "$gbtemp"
+# This test does not trim its output with 'dd' because it needs to verify the correct output size
+tryCmp "$test"/out.gb "$gbtemp"
+evaluateTest
+
+test="rept-trace"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -Bno-collapse -o "$gbtemp" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
 test="same-consts"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
-rgblinkQuiet -o "$gbtemp" "$gbtemp2" "$otemp" 2>"$outtemp"
+rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
 evaluateTest
 
-test="scramble-romx"
+test="scramble-invalid"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -S "romx := 4" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="scramble-specs"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 continueTest
 rgblinkQuiet -o "$gbtemp" -S "romx=3,wramx=4,sram=4" "$otemp" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
-# This test does not compare its exact output with 'tryCmpRom' because no scrambling order is guaranteed
-tryCmpRomSize "$gbtemp" 65536
+# This test does not trim its output with 'dd' because it needs to verify the correct output size
+tryCmp "$test"/out.gb "$gbtemp"
+evaluateTest
+
+test="script-ds"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -l "$test"/script.link "$otemp" "$gbtemp2" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="script-include"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -l "$test"/script.link "$otemp" "$gbtemp2" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="sdcc/good"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" -l "$test"/script.link "$otemp" "$test"/b.rel "$test"/c.rel 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+tryDiff "$test"/ref.out.sym "$outtemp2"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="sdcc/no-script"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet "$otemp" "$test"/b.rel 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="section-conflict/different-mod"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp" "$test"/b.asm
+continueTest
+rgblinkQuiet "$otemp" "$gbtemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
 evaluateTest
 
 test="section-fragment/good"
@@ -229,12 +403,47 @@ rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2"
 tryCmpRom "$test"/ref.out.bin
 evaluateTest
 
+test="section-fragment/size-overflow"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet "$otemp" "$otemp" "$otemp" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
 test="section-fragment/jr-offset"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
 rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="section-fragment/jr-offset-load"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2"
+tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="section-normal/same-name"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp" "$test"/b.asm
+continueTest
+rgblinkQuiet "$otemp" "$gbtemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="section-union/compat"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp2" "$test"/b.asm
+continueTest
+rgblinkQuiet -o "$gbtemp" -l "$test"/script.link "$otemp" "$gbtemp2"
 tryCmpRom "$test"/ref.out.bin
 evaluateTest
 
@@ -252,9 +461,7 @@ startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
-rgblinkQuiet "$gbtemp2" "$otemp" 2>"$outtemp"
-substPath "$otemp" "$test/a.o" "$outtemp"
-substPath "$gbtemp2" "$test/b.o" "$outtemp"
+rgblinkQuiet "$otemp" "$gbtemp2" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
 evaluateTest
 
@@ -263,14 +470,12 @@ startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
-rgblinkQuiet -o "$gbtemp" "$gbtemp2" "$otemp" 2>"$outtemp"
-substPath "$otemp" "$test/a.o" "$outtemp"
-substPath "$gbtemp2" "$test/b.o" "$outtemp"
+rgblinkQuiet -o "$gbtemp" "$otemp" "$gbtemp2" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
 tryCmpRom "$test"/ref.out.bin
 evaluateTest
 
-for i in section-union/*.asm; do
+for i in section-union/*.asm section-fragment/*.asm; do
 	test=${i%.asm}
 	startTest
 	"$RGBASM" -o "$otemp" "${test}.asm"
@@ -287,15 +492,52 @@ for i in section-union/*.asm; do
 	evaluateTest
 done
 
-test="symbols"
+test="symbols/conflict"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp" "$test"/b.asm
+continueTest
+rgblinkQuiet "$otemp" "$gbtemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="symbols/good"
 startTest
 "$RGBASM" -o "$otemp" "$test"/a.asm
 "$RGBASM" -o "$gbtemp2" "$test"/b.asm
 continueTest
-rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$gbtemp2" "$otemp" 2>"$outtemp"
+rgblinkQuiet -o "$gbtemp" -n "$outtemp2" "$otemp" "$gbtemp2" 2>"$outtemp"
 tryDiff "$test"/out.err "$outtemp"
 tryDiff "$test"/ref.out.sym "$outtemp2"
 tryCmpRom "$test"/ref.out.bin
+evaluateTest
+
+test="symbols/unknown"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+"$RGBASM" -o "$gbtemp" "$test"/b.asm
+"$RGBASM" -o "$gbtemp2" "$test"/c.asm
+"$RGBASM" -o "$outtemp" "$test"/d.asm
+"$RGBASM" -o "$outtemp2" "$test"/e.asm
+continueTest
+rgblinkQuiet "$otemp" "$gbtemp" "$gbtemp2" "$outtemp" "$outtemp2" 2>"$outtemp3"
+tryDiff "$test"/out.err "$outtemp3"
+evaluateTest
+
+test="truncation/level1"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -Wtruncation=1 -o "$gbtemp" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
+evaluateTest
+
+test="truncation/level2"
+startTest
+"$RGBASM" -o "$otemp" "$test"/a.asm
+continueTest
+rgblinkQuiet -Wtruncation=2 -o "$gbtemp" "$otemp" 2>"$outtemp"
+tryDiff "$test"/out.err "$outtemp"
 evaluateTest
 
 if [[ "$failed" -eq 0 ]]; then

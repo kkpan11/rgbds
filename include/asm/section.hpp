@@ -1,18 +1,18 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_ASM_SECTION_HPP
 #define RGBDS_ASM_SECTION_HPP
 
 #include <deque>
 #include <memory>
+#include <optional>
+#include <stddef.h>
 #include <stdint.h>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+#include "intern.hpp"
 #include "linkdefs.hpp"
-
-extern uint8_t fillByte;
 
 struct Expression;
 struct FileStackNode;
@@ -42,6 +42,7 @@ struct Section {
 	std::deque<Patch> patches;
 	std::vector<uint8_t> data;
 
+	uint32_t getID() const; // ID of the section in the object file (`UINT32_MAX` if none)
 	bool isSizeKnown() const;
 };
 
@@ -51,9 +52,8 @@ struct SectionSpec {
 	uint16_t alignOfs;
 };
 
-extern std::deque<Section> sectionList;
-extern std::unordered_map<std::string, size_t> sectionMap; // Indexes into `sectionList`
-extern Section *currentSection;
+size_t sect_CountSections();
+void sect_ForEach(void (*callback)(Section &));
 
 Section *sect_FindSectionByName(std::string const &name);
 void sect_NewSection(
@@ -70,34 +70,44 @@ void sect_SetLoadSection(
     SectionSpec const &attrs,
     SectionModifier mod
 );
-void sect_EndLoadSection();
+void sect_EndLoadSection(char const *cause);
+void sect_CheckLoadClosed();
 
 Section *sect_GetSymbolSection();
 uint32_t sect_GetSymbolOffset();
 uint32_t sect_GetOutputOffset();
+std::optional<uint32_t> sect_GetOutputBank();
+
+Patch *sect_AddOutputPatch();
+
 uint32_t sect_GetAlignBytes(uint8_t alignment, uint16_t offset);
 void sect_AlignPC(uint8_t alignment, uint16_t offset);
+
+void sect_CheckSizes();
 
 void sect_StartUnion();
 void sect_NextUnionMember();
 void sect_EndUnion();
 void sect_CheckUnionClosed();
 
-void sect_AbsByte(uint8_t b);
-void sect_AbsByteString(std::vector<uint8_t> const &s);
-void sect_AbsWordString(std::vector<uint8_t> const &s);
-void sect_AbsLongString(std::vector<uint8_t> const &s);
+void sect_ConstByte(uint8_t byte);
+void sect_ByteString(std::vector<int32_t> const &str);
+void sect_WordString(std::vector<int32_t> const &str);
+void sect_LongString(std::vector<int32_t> const &str);
 void sect_Skip(uint32_t skip, bool ds);
-void sect_RelByte(Expression &expr, uint32_t pcShift);
-void sect_RelBytes(uint32_t n, std::vector<Expression> &exprs);
-void sect_RelWord(Expression &expr, uint32_t pcShift);
-void sect_RelLong(Expression &expr, uint32_t pcShift);
-void sect_PCRelByte(Expression &expr, uint32_t pcShift);
-void sect_BinaryFile(std::string const &name, int32_t startPos);
-void sect_BinaryFileSlice(std::string const &name, int32_t startPos, int32_t length);
+void sect_RelByte(Expression const &expr, uint32_t pcShift);
+void sect_RelBytes(uint32_t n, std::vector<Expression> const &exprs);
+void sect_RelWord(Expression const &expr, uint32_t pcShift);
+void sect_RelLong(Expression const &expr, uint32_t pcShift);
+void sect_PCRelByte(Expression const &expr, uint32_t pcShift);
+bool sect_BinaryFile(std::string const &name, uint32_t startPos);
+bool sect_BinaryFileSlice(std::string const &name, uint32_t startPos, uint32_t length);
 
 void sect_EndSection();
 void sect_PushSection();
 void sect_PopSection();
+void sect_CheckStack();
+
+InternedStr sect_PushSectionFragmentLiteral();
 
 #endif // RGBDS_ASM_SECTION_HPP

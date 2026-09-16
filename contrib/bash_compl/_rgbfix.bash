@@ -7,22 +7,26 @@ _rgbfix_completions() {
 	# Empty long opt = it doesn't exit
 	# See the `state` variable below for info about `state_after`
 	declare -A opts=(
+		[h]="help:normal"
 		[V]="version:normal"
-		[j]="non-japanese:normal"
-		[s]="sgb-compatible:normal"
-		[v]="validate:normal"
+		[W]="warning:warning"
+		[w]=":normal"
 		[C]="color-only:normal"
 		[c]="color-compatible:normal"
 		[f]="fix-spec:fix-spec"
 		[i]="game-id:unk"
+		[j]="non-japanese:normal"
 		[k]="new-licensee:unk"
 		[L]="custom-logo:glob-*.1bpp"
 		[l]="old-licensee:unk"
 		[m]="mbc-type:mbc"
 		[n]="rom-version:unk"
+		[o]="output:glob-*.gb *.gbc *.sgb"
 		[p]="pad-value:unk"
 		[r]="ram-size:unk"
+		[s]="sgb-compatible:normal"
 		[t]="title:unk"
+		[v]="validate:normal"
 	)
 	# Parse command-line up to current word
 	local opt_ena=true
@@ -137,6 +141,17 @@ _rgbfix_completions() {
 	COMPREPLY=()
 	case "$state" in
 		unk) # Return with no replies: no idea what to complete!
+			;;
+		warning)
+			mapfile -t COMPREPLY < <(compgen -W "
+				mbc
+				obsolete
+				overwrite
+				sgb
+				truncation
+				all
+				everything
+				error" -P "${cur_word:0:$optlen}" -- "${cur_word:$optlen}")
 			;;
 		fix-spec)
 			COMPREPLY=( "${cur_word}"{l,h,g,L,H,G} )

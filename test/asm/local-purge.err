@@ -1,3 +1,5 @@
-error: local-purge.asm(8):
-    Interpolated symbol ".loc" does not exist
-error: Assembly aborted (1 error)!
+warning: Purging a label `.loc` [-Wpurge]
+    at local-purge.asm(7)
+error: Interpolated symbol `.loc` does not exist; it was purged
+    at local-purge.asm(8)
+Assembly aborted with 1 error

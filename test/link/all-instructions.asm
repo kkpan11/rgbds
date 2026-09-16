@@ -155,7 +155,7 @@ ENDM
     ld  [$ABCD],a
     ldh [$ff00+$DB],a
     ld  [$ff00+c],a
-    ld  [$ff00 + c],a
+    ldh [$ff00 + c],a
     ldh [c],a
 
     ld  a,[bc]
@@ -163,7 +163,7 @@ ENDM
     ld  a,[hl]
     ld  a,[$ABCD]
     ldh a,[$ff00+$DB]
-    ld  a,[$ff00+c]
+    ldh a,[$ff00+c]
     ld  a,[$ff00 + c]
     ldh a,[c]
 
@@ -221,9 +221,9 @@ jrlabel:
 
     ; Stack Operations Instructions
 
-    add sp,$DB
+    add sp,$25
     ld  [$ABCD],sp
-    ld  hl,sp+$DB
+    ld  hl,sp+$25
     ld  hl,sp-$25
     ld  sp,hl
 

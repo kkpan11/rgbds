@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #ifndef RGBDS_ASM_FORMAT_HPP
 #define RGBDS_ASM_FORMAT_HPP
@@ -7,35 +7,24 @@
 #include <stdint.h>
 #include <string>
 
-enum FormatState {
-	FORMAT_SIGN,    // expects '+' or ' ' (optional)
-	FORMAT_PREFIX,  // expects '#' (optional)
-	FORMAT_ALIGN,   // expects '-' (optional)
-	FORMAT_WIDTH,   // expects '0'-'9', max 255 (optional) (leading '0' indicates pad)
-	FORMAT_FRAC,    // got '.', expects '0'-'9', max 255 (optional)
-	FORMAT_DONE,    // got [duXxbofs] (required)
-	FORMAT_INVALID, // got unexpected character
-};
-
 class FormatSpec {
-	FormatState state;
 	int sign;
-	bool prefix;
+	bool exact;
 	bool alignLeft;
 	bool padZero;
 	size_t width;
 	bool hasFrac;
 	size_t fracWidth;
+	bool hasPrec;
+	size_t precision;
 	int type;
-	bool valid;
+	bool parsed;
 
 public:
-	bool isEmpty() const { return !state; }
-	bool isValid() const { return valid || state == FORMAT_DONE; }
-	bool isFinished() const { return state >= FORMAT_DONE; }
+	bool isValid() const { return !!type; }
+	bool isParsed() const { return parsed; }
 
-	void useCharacter(int c);
-	void finishCharacters();
+	size_t parseSpec(char const *spec);
 
 	void appendString(std::string &str, std::string const &value) const;
 	void appendNumber(std::string &str, uint32_t value) const;

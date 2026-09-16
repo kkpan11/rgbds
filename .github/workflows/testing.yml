@@ -1,330 +1,453 @@
-name: "Regression testing"
+name: Regression testing
 on:
   - push
   - pull_request
+
+env:
+  # Force colored output (see https://bixense.com/clicolors/ and https://force-color.org/)
+  TERM: xterm-256color
+  CLICOLOR: 1
+  CLICOLOR_FORCE: 1
+
+  CMAKE_COLOR_DIAGNOSTICS: ON # Tells CMake-generated build systems to have colored output.
+  CMAKE_CONFIG_TYPE: Debug # `cmake --build` now implies `--config Debug`.
+
+  CTEST_PARALLEL_LEVEL: "" # `ctest` now implies `--parallel` (default number of logical CPUs).
+  CTEST_NO_TESTS_ACTION: error # Make CTest fail if it cannot find any tests. (That should never happen.)
+  CTEST_OUTPUT_ON_FAILURE: ON # CTest reports test program output on failure.
+
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: color.ui
+  GIT_CONFIG_VALUE_0: always # Colorful output is helpful even though CI is not considered to be a terminal.
+
+  # We instruct CMake to download and build third-party projects outside of our source tree,
+  # otherwise they can trigger `-Werror=dev` (from the `develop` preset).
+  DEPS_ROOT_DIR: ~/_deps # Note that this needs to be used in a position where Bash will trigger tilde expansion!
+
+# We use bash syntax across OSes for consistency unless otherwise specified
+defaults:
+  run:
+    shell: bash
+
+# We use Ninja as the generator for CMake below because it provides synchronous output by default,
+# and only shows full command lines when they fail.
 
 jobs:
   unix:
     strategy:
       matrix:
-        os: [ubuntu-20.04, ubuntu-22.04, macos-12]
+        os: [ubuntu-22.04, macos-15-intel, macos-26]
         cxx: [g++, clang++]
         buildsys: [make, cmake]
-        exclude:
-          # Don't use `g++` on macOS; it's just an alias to `clang++`.
-          - os: macos-12
-            cxx: g++
+        exclude: # Don't use `g++` on macOS; it's just an alias to `clang++`.
+          - { os: macos-15-intel, cxx: g++ }
+          - { os: macos-26, cxx: g++ }
+        include: # Use `g++-10`, the earliest GCC version we support, on the earliest Ubuntu runner.
+          - { os: ubuntu-22.04, cxx: g++-10, buildsys: make }
+          - { os: ubuntu-22.04, cxx: g++-10, buildsys: cmake }
       fail-fast: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v7
       - name: Install deps
-        shell: bash
         run: |
-          ./.github/scripts/install_deps.sh ${{ matrix.os }}
-      # Export `bison` to allow using the version we install from Homebrew,
-      # instead of the outdated 2.3 one preinstalled on macOS.
-      - name: Build & install using Make
+          .github/scripts/install-deps.sh ${{ matrix.os }} ${{ matrix.cxx }}
+      - name: Build using Make
         if: matrix.buildsys == 'make'
         run: |
-          export PATH="/usr/local/opt/bison/bin:$PATH"
-          make develop -kj Q= CXX=${{ matrix.cxx }}
-          sudo make install -j Q=
-      - name: Build & install using CMake
+          make develop -k -j "$(getconf _NPROCESSORS_ONLN)" Q= CXX=${{ matrix.cxx }}
+      - name: Install using Make
+        if: matrix.buildsys == 'make'
+        run: |
+          sudo make install Q=
+          type rgbasm rgblink rgbfix rgbgfx
+          man -w 1 rgbasm rgblink rgbfix rgbgfx
+      - name: Build using CMake
+        if: matrix.buildsys == 'cmake'
+        # Since GitHub's runners are basically kitchen sinks,
+        # the Mono framework exposes a libpng 1.4.x header, breaking everything.
+        # Searching frameworks last makes Homebrew's libpng be discovered first, which works.
+        # Note that since this is specific to our CI environment, the workaround is
+        # better applied here than in our CMakeLists, where it could affect and break someone else.
+        run: |
+          CXX=${{ matrix.cxx }} cmake -B build -G Ninja --preset develop -DCMAKE_FIND_FRAMEWORK=LAST
+          cmake --build build -- -k 0
+      - name: Install using CMake
         if: matrix.buildsys == 'cmake'
         run: |
-          export PATH="/usr/local/opt/bison/bin:$PATH"
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DSANITIZERS=ON -DMORE_WARNINGS=ON
-          cmake --build build -j --verbose
-          cp build/src/rgb{asm,link,fix,gfx} .
           sudo cmake --install build --verbose
-          cmake --install build --verbose --component "Test support programs"
+          type rgbasm rgblink rgbfix rgbgfx
+          man -w 1 rgbasm rgblink rgbfix rgbgfx
       - name: Package binaries
         run: |
           mkdir bins
           cp rgb{asm,link,fix,gfx} bins
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rgbds-canary-${{ matrix.os }}-${{ matrix.cxx }}-${{ matrix.buildsys }}
           path: bins
+          if-no-files-found: error
       - name: Compute test dependency cache params
         id: test-deps-cache-params
-        shell: bash
         run: |
-          paths=$(test/fetch-test-deps.sh --get-paths)
-          hash=$(test/fetch-test-deps.sh --get-hash)
+          paths=$(test/external/fetch-repos.sh --get-paths)
+          hash=$(test/external/fetch-repos.sh --get-hash)
           tee -a <<<"paths=\"${paths//,/\\n}\"" $GITHUB_OUTPUT
           tee -a <<<"hash=${hash%-}" $GITHUB_OUTPUT
       - name: Check test dependency repositories cache
         id: test-deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ fromJSON(steps.test-deps-cache-params.outputs.paths) }}
           key: ${{ matrix.os }}-${{ steps.test-deps-cache-params.outputs.hash }}
-      - if: steps.test-deps-cache.outputs.cache-hit != 'true'
-        name: Fetch test dependency repositories
+      - name: Fetch test dependency repositories
+        if: steps.test-deps-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
-          test/fetch-test-deps.sh
-      - name: Install test dependency dependencies
-        shell: bash
+          test/external/fetch-repos.sh
+      - name: Run tests using our script
+        if: matrix.buildsys == 'make'
         run: |
-          test/fetch-test-deps.sh --get-deps ${{ matrix.os }}
-      - name: Run tests
-        shell: bash
+          CXX=${{ matrix.cxx }} test/run-tests.sh --os ${{ matrix.os }} --jobs "$(getconf _NPROCESSORS_ONLN)"
+      - name: Run tests using CTest
+        if: matrix.buildsys == 'cmake'
         run: |
-          test/run-tests.sh
+          ctest --test-dir build --schedule-random
 
   macos-static:
-    strategy:
-      matrix:
-        # Don't run on macOS 11; our setup makes clang segfault (YES).
-        os: [macos-12]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v7
       - name: Install deps
-        shell: bash
         run: |
-          ./.github/scripts/install_deps.sh ${{ matrix.os }}
-      # Export `bison` to allow using the version we install from Homebrew,
-      # instead of the outdated one preinstalled on macOS (which doesn't
-      # even support `-Wall`...).
-      - name: Build & install
+          .github/scripts/install-deps.sh macos lld
+      - name: Cache library deps
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.DEPS_ROOT_DIR }}/*-tmp/
+          key: dep-srcs-${{ hashFiles('cmake/deps.cmake') }}
+          enableCrossOsArchive: true
+      - name: Build
         run: |
-          export PATH="/usr/local/opt/bison/bin:$PATH"
-          make -kj CXXFLAGS="-O3 -flto -DNDEBUG -mmacosx-version-min=10.9" PKG_CONFIG="pkg-config --static" PNGLDLIBS="$(pkg-config --static --libs-only-L libpng | cut -c 3-)/libpng.a $(pkg-config --static --libs-only-l libpng | sed s/-lpng[0-9]*//g)" Q=
+          cmake -B build -G Ninja --preset macos-static -DFETCHCONTENT_BASE_DIR="${{ env.DEPS_ROOT_DIR }}"
+          cmake --build build -- -k 0
+        env:
+          LDFLAGS: -fuse-ld=lld # cmake/macos-static.cmake comments explain why we use lld.
+      - name: Install
+        run: |
+          sudo cmake --install build --verbose
+          type rgbasm rgblink rgbfix rgbgfx
+          man -w 1 rgbasm rgblink rgbfix rgbgfx
       - name: Package binaries
         run: |
           mkdir bins
           cp rgb{asm,link,fix,gfx} bins
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: rgbds-canary-${{ matrix.os }}-${{ matrix.buildsys }}
+          name: rgbds-canary-macos-static
           path: bins
+          if-no-files-found: error
       - name: Compute test dependency cache params
         id: test-deps-cache-params
-        shell: bash
         run: |
-          paths=$(test/fetch-test-deps.sh --get-paths)
-          hash=$(test/fetch-test-deps.sh --get-hash)
+          paths=$(test/external/fetch-repos.sh --get-paths)
+          hash=$(test/external/fetch-repos.sh --get-hash)
           tee -a <<<"paths=\"${paths//,/\\n}\"" $GITHUB_OUTPUT
           tee -a <<<"hash=${hash%-}" $GITHUB_OUTPUT
       - name: Check test dependency repositories cache
         id: test-deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ fromJSON(steps.test-deps-cache-params.outputs.paths) }}
-          key: ${{ matrix.os }}-${{ steps.test-deps-cache-params.outputs.hash }}
-      - if: steps.test-deps-cache.outputs.cache-hit != 'true'
-        name: Fetch test dependency repositories
+          key: macos-26-${{ steps.test-deps-cache-params.outputs.hash }}
+      - name: Fetch test dependency repositories
+        if: steps.test-deps-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
-          test/fetch-test-deps.sh
-      - name: Install test dependency dependencies
-        shell: bash
-        run: |
-          test/fetch-test-deps.sh --get-deps ${{ matrix.os }}
+          test/external/fetch-repos.sh
       - name: Run tests
-        shell: bash
         run: |
-          test/run-tests.sh
+          ctest --test-dir build --schedule-random
 
   windows:
     strategy:
       matrix:
         bits: [32, 64]
-        os: [windows-2019, windows-2022]
-        include:
-          - bits: 32
-            arch: x86
-            platform: Win32
-          - bits: 64
-            arch: x86_x64
-            platform: x64
+        os: [windows-2022, windows-2025]
       fail-fast: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v7
       - name: Install deps
-        run: .github/scripts/get_win_deps.ps1
-      - uses: actions/cache@v4
-        id: cache
+        run: |
+          bash .github/scripts/install-deps.sh ${{ matrix.os }}
+      - name: Cache library deps
+        uses: actions/cache@v5
         with:
-          path: |
-            zbuild
-            pngbuild
-          key: ${{ matrix.arch }}-${{ hashFiles('zlib/**', 'libpng/**') }}
-      - name: Build zlib
-        run: | # BUILD_SHARED_LIBS causes the output DLL to be correctly called `zlib1.dll`
-          cmake -S zlib -B zbuild -A ${{ matrix.platform }} -Wno-dev -DCMAKE_INSTALL_PREFIX=install_dir -DBUILD_SHARED_LIBS=ON
-          cmake --build zbuild --config Release -j
-        if: steps.cache.outputs.cache-hit != 'true'
-      - name: Install zlib
+          path: ${{ env.DEPS_ROOT_DIR }}/*-tmp/
+          key: dep-srcs-${{ hashFiles('cmake/deps.cmake') }}
+          enableCrossOsArchive: true
+      - name: Build
+        shell: cmd
+        run: | # ASan seems to be broken on Windows, so we disable it.
+          call .github\scripts\msvc-env.bat ${{ matrix.bits }}
+          cmake -B build -G Ninja --preset develop -DFETCHCONTENT_BASE_DIR="${{ env.DEPS_ROOT_DIR }}" ^
+                -DSANITIZERS=OFF -DCMAKE_C_FLAGS="/nologo"
+          cmake --build build -- -k 0
+      - name: Install
+        shell: cmd
         run: |
-          cmake --install zbuild
-      - name: Build libpng
-        shell: bash
-        run: |
-          cmake -S libpng -B pngbuild -A ${{ matrix.platform }} -Wno-dev -DCMAKE_INSTALL_PREFIX=install_dir -DPNG_SHARED=ON -DPNG_STATIC=OFF -DPNG_TESTS=OFF
-          cmake --build pngbuild --config Release -j
-        if: steps.cache.outputs.cache-hit != 'true'
-      - name: Install libpng
-        run: |
-          cmake --install pngbuild
-      - name: Build Windows binaries
-        shell: bash
-        run: |
-          cmake -S . -B build -A ${{ matrix.platform }} -DCMAKE_INSTALL_PREFIX=install_dir -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j --verbose
-          cmake --install build --verbose --prefix install_dir
-          cmake --install build --verbose --component "Test support programs"
+          cmake --install build --verbose
+          where rgbasm rgblink rgbfix rgbgfx
       - name: Package binaries
-        shell: bash
+        working-directory: build
         run: |
-          mkdir bins
-          cp install_dir/bin/{rgbasm.exe,rgblink.exe,rgbfix.exe,rgbgfx.exe,zlib1.dll,libpng16.dll} bins
+          cpack -DCPACK_PACKAGE_FILE_NAME=rgbds-win${{ matrix.bits }} -G ZIP --verbose
       - name: Upload Windows binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rgbds-canary-w${{ matrix.bits }}-${{ matrix.os }}
-          path: bins
+          path: build/rgbds-win${{ matrix.bits }}.zip
+          if-no-files-found: error
       - name: Compute test dependency cache params
         id: test-deps-cache-params
-        shell: bash
         run: |
-          paths=$(test/fetch-test-deps.sh --get-paths)
-          hash=$(test/fetch-test-deps.sh --get-hash)
+          paths=$(test/external/fetch-repos.sh --get-paths)
+          hash=$(test/external/fetch-repos.sh --get-hash)
           tee -a <<<"paths=\"${paths//,/\\n}\"" $GITHUB_OUTPUT
           tee -a <<<"hash=${hash%-}" $GITHUB_OUTPUT
       - name: Check test dependency repositories cache
         id: test-deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ fromJSON(steps.test-deps-cache-params.outputs.paths) }}
           key: ${{ matrix.os }}-${{ matrix.bits }}-${{ steps.test-deps-cache-params.outputs.hash }}
-      - if: steps.test-deps-cache.outputs.cache-hit != 'true'
-        name: Fetch test dependency repositories
-        shell: bash
+      - name: Fetch test dependency repositories
+        if: steps.test-deps-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
-          test/fetch-test-deps.sh
-      - name: Install test dependency dependencies
-        shell: bash
+          test/external/fetch-repos.sh
+      - name: Run tests using CTest
         run: |
-          test/fetch-test-deps.sh --get-deps ${{ matrix.os }}
-      - name: Run tests
-        shell: bash
-        run: |
-          cp bins/* .
-          cp bins/*.dll test/gfx
-          test/run-tests.sh
+          ctest --test-dir build --schedule-random
 
   windows-mingw-build:
     strategy:
       matrix:
         bits: [32, 64]
-        include:
-          - bits: 32
-            arch: i686
-            triplet: i686-w64-mingw32
-          - bits: 64
-            arch: x86-64
-            triplet: x86_64-w64-mingw32
       fail-fast: false
-    runs-on: ubuntu-22.04
-    env:
-      DIST_DIR: win${{ matrix.bits }}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v7
       - name: Install deps
-        shell: bash
         run: |
-          ./.github/scripts/install_deps.sh ${{ matrix.os }}
-      - name: Install MinGW
-        run: | # dpkg-dev is apparently required for pkg-config for cross-building
-          sudo apt-get install g++-mingw-w64-${{ matrix.arch }}-win32 mingw-w64-tools libz-mingw-w64-dev dpkg-dev
-      - name: Install libpng dev headers for MinGW
-        run: |
-          sudo ./.github/scripts/mingw-w64-libpng-dev.sh ${{ matrix.triplet }}
+          .github/scripts/install-deps.sh ubuntu mingw${{ matrix.bits }}
+      - name: Cache library deps
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.DEPS_ROOT_DIR }}/*-tmp/
+          key: dep-srcs-${{ hashFiles('cmake/deps.cmake') }}
+          enableCrossOsArchive: true
       - name: Cross-build Windows binaries
+        run: | # MinGW doesn't support `--preset develop` sanitizers ASan or UBSan, so we disable them.
+          dll_search_dir=$(printf '%s\n' /usr/lib/gcc/*-w64-mingw32/*-win32 | tee -a /dev/stderr)
+          cmake -B build -G Ninja --preset develop -DFETCHCONTENT_BASE_DIR="${{ env.DEPS_ROOT_DIR }}" \
+                -DSANITIZERS=OFF -DDLL_SEARCH_DIRS="$dll_search_dir" \
+                --toolchain cmake/toolchain-mingw${{ matrix.bits }}.cmake
+          cmake --build build -- -k 0
+      - name: Package Windows binaries
         run: |
-          make mingw${{ matrix.bits }} -kj Q=
-      - name: Package binaries
-        run: | # DLL dependencies can be figured out using e.g. Dependency Walker or objdump -p
-          mkdir bins
-          mv -v rgb{asm,link,fix,gfx}.exe bins/
-          cp -v /usr/${{ matrix.triplet }}/lib/zlib1.dll bins
-          cp -v /usr/${{ matrix.triplet }}/bin/libpng16-16.dll bins
-          cp -v /usr/lib/gcc/${{ matrix.triplet }}/10-win32/lib{ssp-0,stdc++-6}.dll bins
-          [ "${{ matrix.bits }}" -ne 32 ] || cp -v /usr/lib/gcc/${{ matrix.triplet }}/10-win32/libgcc_s_dw2-1.dll bins
+          cmake --install build --prefix . --verbose --component binaries
+          cmake --install build --prefix . --verbose --component shared-libs
       - name: Upload Windows binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rgbds-canary-mingw-win${{ matrix.bits }}
-          path: bins
+          path: bin
+          if-no-files-found: error
       - name: Upload Windows test binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: testing-programs-mingw-win${{ matrix.bits }}
           path: |
             test/gfx/randtilegen.exe
             test/gfx/rgbgfx_test.exe
-            test/link/unmangle.exe
+          if-no-files-found: error
 
   windows-mingw-testing:
     needs: windows-mingw-build
     strategy:
       matrix:
-        os: [windows-2019, windows-2022]
+        os: [windows-2022, windows-2025]
         bits: [32, 64]
       fail-fast: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Install test deps
+        run: |
+          .github/scripts/install-deps.sh windowsmingw
       - name: Retrieve binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: rgbds-canary-mingw-win${{ matrix.bits }}
           path: bins
       - name: Retrieve test binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: testing-programs-mingw-win${{ matrix.bits }}
-          path: test
+          path: test/gfx
       - name: Extract binaries
-        shell: bash
         run: |
           cp bins/* .
           cp bins/*.dll test/gfx
       - name: Compute test dependency cache params
         id: test-deps-cache-params
-        shell: bash
         run: |
-          paths=$(test/fetch-test-deps.sh --get-paths)
-          hash=$(test/fetch-test-deps.sh --get-hash)
+          paths=$(test/external/fetch-repos.sh --get-paths)
+          hash=$(test/external/fetch-repos.sh --get-hash)
           tee -a <<<"paths=\"${paths//,/\\n}\"" $GITHUB_OUTPUT
           tee -a <<<"hash=${hash%-}" $GITHUB_OUTPUT
       - name: Check test dependency repositories cache
         id: test-deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ fromJSON(steps.test-deps-cache-params.outputs.paths) }}
           key: mingw-${{ matrix.bits }}-${{ steps.test-deps-cache-params.outputs.hash }}
-      - if: steps.test-deps-cache.outputs.cache-hit != 'true'
-        name: Fetch test dependency repositories
-        shell: bash
+      - name: Fetch test dependency repositories
+        if: steps.test-deps-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
-          test/fetch-test-deps.sh
-      - name: Install test dependency dependencies
-        shell: bash
-        run: |
-          test/fetch-test-deps.sh --get-deps ${{ matrix.os }}
+          test/external/fetch-repos.sh
       - name: Run tests
-        shell: bash
         run: |
-          test/run-tests.sh
+          test/run-tests.sh --os ${{ matrix.os }} --jobs "$(getconf _NPROCESSORS_ONLN)"
+
+  cygwin:
+    strategy:
+      matrix:
+        arch: [x86, x86_64]
+      fail-fast: false
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      CYGWIN_NOWINPATH: 1
+      CHERE_INVOKING: 1
+    defaults:
+      run:
+        shell: C:\cygwin\bin\bash.exe -leo igncr '{0}'
+    steps:
+      - name: Save Windows git location for the PATH
+        shell: pwsh
+        run: | # The `cygwin/cygwin-install-action` step will override the PATH with Cygwin's binaries
+          "ORIGINAL_GIT_DIR=$(Split-Path (Get-Command git).Source)" >> $env:GITHUB_ENV
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Setup Cygwin
+        uses: cygwin/cygwin-install-action@v6
+        with:
+          platform: ${{ matrix.arch }}
+          packages: >-
+            bison
+            cmake
+            gcc-g++
+            git
+            libpng-devel
+            make
+            ninja
+            pkg-config
+            python312
+            python312-imaging
+      - name: Build using Make
+        if: matrix.arch == 'x86'
+        run: | # Cygwin doesn't support `make develop` sanitizers ASan or UBSan, so we don't use it.
+          make -k -j "$(getconf _NPROCESSORS_ONLN)" Q=
+      - name: Install using Make
+        if: matrix.arch == 'x86'
+        run: |
+          make install Q=
+          type rgbasm rgblink rgbfix rgbgfx
+          man -w 1 rgbasm rgblink rgbfix rgbgfx
+      - name: Build using CMake
+        if: matrix.arch == 'x86_64'
+        run: | # Cygwin doesn't support `--preset develop` sanitizers ASan or UBSan, so we disable them.
+          cmake -B build -G Ninja --preset develop -DSANITIZERS=OFF
+          cmake --build build -- -k 0
+      - name: Install using CMake
+        if: matrix.arch == 'x86_64'
+        run: |
+          cmake --install build --verbose
+          type rgbasm rgblink rgbfix rgbgfx
+          man -w 1 rgbasm rgblink rgbfix rgbgfx
+      - name: Compute test dependency cache params
+        if: matrix.arch == 'x86_64'
+        id: test-deps-cache-params
+        run: |
+          paths=$(test/external/fetch-repos.sh --get-paths)
+          hash=$(test/external/fetch-repos.sh --get-hash)
+          tee -a <<<"paths=\"${paths//,/\\n}\"" $GITHUB_OUTPUT
+          tee -a <<<"hash=${hash%-}" $GITHUB_OUTPUT
+      - name: Check test dependency repositories cache
+        if: matrix.arch == 'x86_64'
+        id: test-deps-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ fromJSON(steps.test-deps-cache-params.outputs.paths) }}
+          key: cygwin-${{ matrix.bits }}-${{ steps.test-deps-cache-params.outputs.hash }}
+      - name: Fetch test dependency repositories
+        if: matrix.arch == 'x86_64' && steps.test-deps-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          test/external/fetch-repos.sh
+      - name: Run tests using our script
+        if: matrix.arch == 'x86'
+        run: | # 32-bit Cygwin's `git` 2.38 doesn't support `git clone --revision`, so we don't fetch/run external tests.
+          test/run-tests.sh --os cygwin --only-internal --jobs "$(getconf _NPROCESSORS_ONLN)"
+      - name: Run tests using CTest
+        if: matrix.arch == 'x86_64'
+        run: |
+          ctest --test-dir build --schedule-random
+      - name: Use Windows git location in the PATH
+        shell: pwsh
+        run: | # Prevents the `actions/checkout` post-job cleanup from using Cygwin's git binary
+          "$env:ORIGINAL_GIT_DIR" >> $env:GITHUB_PATH
+
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Build & test using CMake on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          envs: >-
+            TERM CLICOLOR CLICOLOR_FORCE
+            CMAKE_COLOR_DIAGNOSTICS CMAKE_CONFIG_TYPE
+            CTEST_PARALLEL_LEVEL
+            CTEST_NO_TESTS_ACTION CTEST_OUTPUT_ON_FAILURE
+            GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          release: "15.1"
+          usesh: true
+          copyback: false
+          prepare: |
+            .github/scripts/install-deps.sh freebsd
+          run: |
+            : # Build
+            cmake -B build -G Ninja --preset develop
+            cmake --build build -- -k 0
+            : # Install
+            cmake --install build --verbose
+            type rgbasm rgblink rgbfix rgbgfx
+            man -w 1 rgbasm rgblink rgbfix rgbgfx
+            : # Run tests
+            : # Leak detection is not supported on FreeBSD, so we disable it.
+            . .github/scripts/freebsd-env.sh
+            ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build --schedule-random

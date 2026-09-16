@@ -24,12 +24,14 @@ _rgbasm_completions() {
 	# Empty long opt = it doesn't exit
 	# See the `state` variable below for info about `state_after`
 	declare -A opts=(
+		[h]="help:normal"
 		[V]="version:normal"
-		[E]="export-all:normal"
-		[v]="verbose:normal"
+		[W]="warning:warning"
 		[w]=":normal"
+		[B]="backtrace:unk"
 		[b]="binary-digits:unk"
 		[D]="define:unk"
+		[E]="export-all:normal"
 		[g]="gfx-chars:unk"
 		[I]="include:dir"
 		[M]="dependfile:glob-*.mk *.d"
@@ -38,7 +40,8 @@ _rgbasm_completions() {
 		[p]="pad-value:unk"
 		[Q]="q-precision:unk"
 		[r]="recursion-depth:unk"
-		[W]="warning:warning"
+		[s]="state:unk"
+		[v]="verbose:normal"
 		[X]="max-errors:unk"
 	)
 	# Parse command-line up to current word
@@ -59,7 +62,7 @@ _rgbasm_completions() {
 	parse_short_opt() {
 		# These options act like a long option (= takes up the entire word), but only use a single dash
 		# So, they need some special handling
-		if [[ "$1" = "-M"[GP] ]]; then
+		if [[ "$1" = "-M"[CGP] ]]; then
 			state=normal
 			optlen=${#1}
 			return;
@@ -144,7 +147,7 @@ _rgbasm_completions() {
 			# It is, try to complete one
 			mapfile -t COMPREPLY < <(compgen -W "${opts[*]%%:*}" -P '--' -- "${cur_word#--}")
 			return 0
-		elif [[ "$cur_word" = '-M'[GPQT] ]]; then
+		elif [[ "$cur_word" = '-M'[CGPQT] ]]; then
 			# These options act like long opts with no arguments, so return them and exactly them
 			COMPREPLY=( "$cur_word" )
 			return 0
@@ -153,7 +156,7 @@ _rgbasm_completions() {
 			parse_short_opt "$cur_word"
 
 			if [[ "$state" = 'normal' ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "${!opts[*]}" -P "$cur_word" ''; compgen -W '-MG -MP -MQ -MT' "$cur_word")
+				mapfile -t COMPREPLY < <(compgen -W "${!opts[*]}" -P "$cur_word" ''; compgen -W '-MC -MG -MP -MQ -MT' "$cur_word")
 				return 0
 			elif [[ "$optlen" = "${#cur_word}" && "$state" != "warning" ]]; then
 				# This short option group only awaits its argument!
@@ -181,15 +184,19 @@ _rgbasm_completions() {
 				empty-data-directive
 				empty-macro-arg
 				empty-strrpl
+				export-undefined
 				large-constant
 				macro-shift
 				nested-comment
 				numeric-string
 				obsolete
+				purge
 				shift
 				shift-amount
 				truncation
 				unmapped-char
+				unmatched-directive
+				unterminated-load
 				user
 				all
 				extra

@@ -1,43 +1,38 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 // Fixed-point math routines
 
 #include "asm/fixpoint.hpp"
 
 #include <math.h>
+#include <numbers>
+#include <stdint.h>
 
-#ifndef M_PI
-	#define M_PI 3.14159265358979323846
-#endif
+#include "helpers.hpp" // assume
 
-uint8_t fixPrecision;
-
-uint8_t fix_Precision() {
-	return fixPrecision;
-}
-
-double fix_PrecisionFactor() {
-	return pow(2.0, fixPrecision);
-}
+static constexpr double tau = std::numbers::pi * 2;
 
 static double fix2double(int32_t i, int32_t q) {
 	return i / pow(2.0, q);
 }
 
 static int32_t double2fix(double d, int32_t q) {
-	if (isnan(d))
+	if (isnan(d)) {
 		return 0;
-	if (isinf(d))
+	}
+	if (isinf(d)) {
 		return d < 0 ? INT32_MIN : INT32_MAX;
-	return (int32_t)round(d * pow(2.0, q));
+	}
+	double v = round(d * pow(2.0, q));
+	return v < INT32_MIN ? INT32_MIN : v > INT32_MAX ? INT32_MAX : static_cast<int32_t>(v);
 }
 
 static double turn2rad(double t) {
-	return t * (M_PI * 2);
+	return t * tau;
 }
 
 static double rad2turn(double r) {
-	return r / (M_PI * 2);
+	return r / tau;
 }
 
 int32_t fix_Sin(int32_t i, int32_t q) {
@@ -73,11 +68,20 @@ int32_t fix_Mul(int32_t i, int32_t j, int32_t q) {
 }
 
 int32_t fix_Div(int32_t i, int32_t j, int32_t q) {
-	return double2fix(fix2double(i, q) / fix2double(j, q), q);
+	double dividend = fix2double(i, q);
+	double divisor = fix2double(j, q);
+	if (fpclassify(divisor) == FP_ZERO) {
+		return dividend < 0 ? INT32_MIN : dividend > 0 ? INT32_MAX : 0;
+	}
+	return double2fix(dividend / divisor, q);
 }
 
 int32_t fix_Mod(int32_t i, int32_t j, int32_t q) {
-	return double2fix(fmod(fix2double(i, q), fix2double(j, q)), q);
+	double divisor = fix2double(j, q);
+	if (fpclassify(divisor) == FP_ZERO) {
+		return 0;
+	}
+	return double2fix(fmod(fix2double(i, q), divisor), q);
 }
 
 int32_t fix_Pow(int32_t i, int32_t j, int32_t q) {
@@ -85,7 +89,14 @@ int32_t fix_Pow(int32_t i, int32_t j, int32_t q) {
 }
 
 int32_t fix_Log(int32_t i, int32_t j, int32_t q) {
-	return double2fix(log(fix2double(i, q)) / log(fix2double(j, q)), q);
+	double divisor = log(fix2double(j, q));
+	if (isnan(divisor) || isinf(divisor)) {
+		return 0;
+	}
+	if (fpclassify(divisor) == FP_ZERO) {
+		return INT32_MAX;
+	}
+	return double2fix(log(fix2double(i, q)) / divisor, q);
 }
 
 int32_t fix_Round(int32_t i, int32_t q) {

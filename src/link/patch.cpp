@@ -1,29 +1,32 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #include "link/patch.hpp"
 
 #include <deque>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <variant>
 #include <vector>
 
+#include "diagnostics.hpp"
 #include "helpers.hpp" // assume
 #include "linkdefs.hpp"
 #include "opmath.hpp"
+#include "verbosity.hpp"
 
-#include "link/main.hpp"
 #include "link/section.hpp"
 #include "link/symbol.hpp"
+#include "link/warning.hpp"
 
-std::deque<Assertion> assertions;
+static std::deque<Assertion> assertions;
 
 struct RPNStackEntry {
 	int32_t value;
 	bool errorFlag; // Whether the value is a placeholder inserted for error recovery
 };
 
-std::deque<RPNStackEntry> rpnStack;
+static std::deque<RPNStackEntry> rpnStack;
 
 static void pushRPN(int32_t value, bool comesFromError) {
 	rpnStack.push_front({.value = value, .errorFlag = comesFromError});
@@ -33,9 +36,34 @@ static void pushRPN(int32_t value, bool comesFromError) {
 // has popped any values with the error flag set.
 static bool isError = false;
 
+#define diagnosticAt(patch, id, ...) \
+	do { \
+		bool errorDiag = warnings.getWarningBehavior(id) == WarningBehavior::ERROR; \
+		if (!isError || !errorDiag) { \
+			warningAt(patch, id, __VA_ARGS__); \
+		} \
+		if (errorDiag) { \
+			isError = true; \
+		} \
+	} while (0)
+
+#define rpnErrorAt(...) \
+	do { \
+		errorAt(__VA_ARGS__); \
+		isError = true; \
+	} while (0)
+
+#define firstErrorAt(...) \
+	do { \
+		if (!isError) { \
+			rpnErrorAt(__VA_ARGS__); \
+		} \
+	} while (0)
+
 static int32_t popRPN(Patch const &patch) {
-	if (rpnStack.empty())
-		fatal(patch.src, patch.lineNo, "Internal error, RPN stack empty");
+	if (rpnStack.empty()) {
+		fatalAt(patch, "Internal error, RPN stack empty");
+	}
 
 	RPNStackEntry entry = rpnStack.front();
 
@@ -47,40 +75,35 @@ static int32_t popRPN(Patch const &patch) {
 // RPN operators
 
 static uint32_t getRPNByte(uint8_t const *&expression, int32_t &size, Patch const &patch) {
-	if (!size--)
-		fatal(patch.src, patch.lineNo, "Internal error, RPN expression overread");
+	if (!size--) {
+		fatalAt(patch, "Internal error, RPN expression overread");
+	}
 
 	return *expression++;
 }
 
 static Symbol const *getSymbol(std::vector<Symbol> const &symbolList, uint32_t index) {
-	assume(index != (uint32_t)-1); // PC needs to be handled specially, not here
+	assume(index != UINT32_MAX);       // PC needs to be handled specially, not here
+	assume(index < symbolList.size()); // This needs to be checked before calling
 	Symbol const &symbol = symbolList[index];
 
 	// If the symbol is defined elsewhere...
-	if (symbol.type == SYMTYPE_IMPORT)
+	if (symbol.type == SYMTYPE_IMPORT) {
 		return sym_GetSymbol(symbol.name);
+	}
 
 	return &symbol;
 }
 
-/*
- * Compute a patch's value from its RPN string.
- * @param patch The patch to compute the value of
- * @param section The section the patch is contained in
- * @return The patch's value
- * @return isError Set if an error occurred during evaluation, and further
- *                 errors caused by the value should be suppressed.
- */
+// Compute a patch's value from its RPN string.
 static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fileSymbols) {
 	uint8_t const *expression = patch.rpnExpression.data();
-	int32_t size = (int32_t)patch.rpnExpression.size();
+	int32_t size = static_cast<int32_t>(patch.rpnExpression.size());
 
 	rpnStack.clear();
 
 	while (size > 0) {
-		RPNCommand command = (RPNCommand)getRPNByte(expression, size, patch);
-		int32_t value;
+		RPNCommand command = static_cast<RPNCommand>(getRPNByte(expression, size, patch));
 
 		isError = false;
 
@@ -88,55 +111,76 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 		// C++ does not guarantee order of evaluation of operands!
 		// So, if there are two `popRPN` in the same expression, make
 		// sure the operation is commutative.
+		int32_t value;
 		switch (command) {
 		case RPN_ADD:
-			value = popRPN(patch) + popRPN(patch);
+			value = op_add(popRPN(patch), popRPN(patch));
 			break;
 		case RPN_SUB:
 			value = popRPN(patch);
-			value = popRPN(patch) - value;
+			value = op_sub(popRPN(patch), value);
 			break;
 		case RPN_MUL:
-			value = popRPN(patch) * popRPN(patch);
+			value = op_mul(popRPN(patch), popRPN(patch));
 			break;
 		case RPN_DIV:
 			value = popRPN(patch);
 			if (value == 0) {
-				if (!isError)
-					error(patch.src, patch.lineNo, "Division by 0");
-				isError = true;
+				firstErrorAt(patch, "Division by 0");
 				popRPN(patch);
-				value = INT32_MAX;
+				value = 0;
+			} else if (int32_t lval = popRPN(patch); lval == INT32_MIN && value == -1) {
+				diagnosticAt(
+				    patch,
+				    WARNING_DIV,
+				    "Division of %" PRId32 " by -1 yields %" PRId32,
+				    INT32_MIN,
+				    INT32_MIN
+				);
+				value = INT32_MIN;
 			} else {
-				value = op_divide(popRPN(patch), value);
+				value = op_divide(lval, value);
 			}
 			break;
 		case RPN_MOD:
 			value = popRPN(patch);
 			if (value == 0) {
-				if (!isError)
-					error(patch.src, patch.lineNo, "Modulo by 0");
-				isError = true;
+				firstErrorAt(patch, "Modulo by 0");
 				popRPN(patch);
 				value = 0;
+			} else if (int32_t lval = popRPN(patch); lval == INT32_MIN && value == -1) {
+				diagnosticAt(patch, WARNING_DIV, "Modulo of %" PRId32 " by -1 yields 0", INT32_MIN);
+				value = 0;
 			} else {
-				value = op_modulo(popRPN(patch), value);
+				value = op_modulo(lval, value);
 			}
 			break;
 		case RPN_NEG:
-			value = -popRPN(patch);
+			value = op_neg(popRPN(patch));
 			break;
 		case RPN_EXP:
 			value = popRPN(patch);
 			if (value < 0) {
-				if (!isError)
-					error(patch.src, patch.lineNo, "Exponent by negative");
-				isError = true;
+				firstErrorAt(patch, "Exponent by negative value %" PRId32, value);
 				popRPN(patch);
 				value = 0;
 			} else {
 				value = op_exponent(popRPN(patch), value);
 			}
+			break;
+
+		case RPN_HIGH:
+			value = op_high(popRPN(patch));
+			break;
+		case RPN_LOW:
+			value = op_low(popRPN(patch));
+			break;
+
+		case RPN_BITWIDTH:
+			value = op_bitwidth(popRPN(patch));
+			break;
+		case RPN_TZCOUNT:
+			value = op_tzcount(popRPN(patch));
 			break;
 
 		case RPN_OR:
@@ -189,60 +233,97 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 
 		case RPN_SHL:
 			value = popRPN(patch);
+			if (value < 0) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting left by negative amount %" PRId32, value
+				);
+			}
+			if (value >= 32) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting left by large amount %" PRId32, value
+				);
+			}
 			value = op_shift_left(popRPN(patch), value);
 			break;
-		case RPN_SHR:
+		case RPN_SHR: {
 			value = popRPN(patch);
-			value = op_shift_right(popRPN(patch), value);
+			int32_t lval = popRPN(patch);
+			if (lval < 0) {
+				diagnosticAt(patch, WARNING_SHIFT, "Shifting right negative value %" PRId32, lval);
+			}
+			if (value < 0) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting right by negative amount %" PRId32, value
+				);
+			}
+			if (value >= 32) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting right by large amount %" PRId32, value
+				);
+			}
+			value = op_shift_right(lval, value);
 			break;
+		}
 		case RPN_USHR:
 			value = popRPN(patch);
+			if (value < 0) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting right by negative amount %" PRId32, value
+				);
+			}
+			if (value >= 32) {
+				diagnosticAt(
+				    patch, WARNING_SHIFT_AMOUNT, "Shifting right by large amount %" PRId32, value
+				);
+			}
 			value = op_shift_right_unsigned(popRPN(patch), value);
 			break;
 
-		case RPN_BANK_SYM:
-			value = 0;
-			for (uint8_t shift = 0; shift < 32; shift += 8)
-				value |= getRPNByte(expression, size, patch) << shift;
+		case RPN_BANK_SYM: {
+			uint32_t symID = 0;
+			for (uint8_t shift = 0; shift < 32; shift += 8) {
+				symID |= getRPNByte(expression, size, patch) << shift;
+			}
 
-			if (Symbol const *symbol = getSymbol(fileSymbols, value); !symbol) {
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Requested BANK() of symbol \"%s\", which was not found",
-				    fileSymbols[value].name.c_str()
+			if (symID >= fileSymbols.size()) {
+				fatalAt(patch, "Requested `BANK()` of invalid symbol ID #%" PRIu32, symID);
+			} else if (Symbol const *symbol = getSymbol(fileSymbols, symID); !symbol) {
+				rpnErrorAt(
+				    patch,
+				    "Requested `BANK()` of undefined symbol `%s`",
+				    fileSymbols[symID].name.c_str()
 				);
-				isError = true;
 				value = 1;
-			} else if (auto *label = std::get_if<Label>(&symbol->data); label) {
-				value = label->section->bank;
+			} else if (std::holds_alternative<Label>(symbol->data)) {
+				if (Label const &label = std::get<Label>(symbol->data); !label.section) {
+					rpnErrorAt(
+					    patch,
+					    "Requested `BANK()` of label `%s` outside of a section",
+					    fileSymbols[symID].name.c_str()
+					);
+					value = 0;
+				} else {
+					value = label.section->bank;
+				}
 			} else {
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Requested BANK() of non-label symbol \"%s\"",
-				    fileSymbols[value].name.c_str()
+				rpnErrorAt(
+				    patch,
+				    "Requested `BANK()` of non-label symbol `%s`",
+				    fileSymbols[symID].name.c_str()
 				);
-				isError = true;
 				value = 1;
 			}
 			break;
+		}
 
 		case RPN_BANK_SECT: {
 			// `expression` is not guaranteed to be '\0'-terminated. If it is not,
 			// `getRPNByte` will have a fatal internal error.
-			char const *name = (char const *)expression;
-			while (getRPNByte(expression, size, patch))
-				;
+			char const *name = reinterpret_cast<char const *>(expression);
+			while (getRPNByte(expression, size, patch)) {}
 
 			if (Section const *sect = sect_GetSection(name); !sect) {
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Requested BANK() of section \"%s\", which was not found",
-				    name
-				);
-				isError = true;
+				rpnErrorAt(patch, "Requested `BANK()` of undefined section \"%s\"", name);
 				value = 1;
 			} else {
 				value = sect->bank;
@@ -252,8 +333,7 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 
 		case RPN_BANK_SELF:
 			if (!patch.pcSection) {
-				error(patch.src, patch.lineNo, "PC has no bank outside a section");
-				isError = true;
+				rpnErrorAt(patch, "PC has no bank outside of a section");
 				value = 1;
 			} else {
 				value = patch.pcSection->bank;
@@ -262,18 +342,11 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 
 		case RPN_SIZEOF_SECT: {
 			// This has assumptions commented in the `RPN_BANK_SECT` case above.
-			char const *name = (char const *)expression;
-			while (getRPNByte(expression, size, patch))
-				;
+			char const *name = reinterpret_cast<char const *>(expression);
+			while (getRPNByte(expression, size, patch)) {}
 
 			if (Section const *sect = sect_GetSection(name); !sect) {
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Requested SIZEOF() of section \"%s\", which was not found",
-				    name
-				);
-				isError = true;
+				rpnErrorAt(patch, "Requested `SIZEOF()` of undefined section \"%s\"", name);
 				value = 1;
 			} else {
 				value = sect->size;
@@ -283,18 +356,11 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 
 		case RPN_STARTOF_SECT: {
 			// This has assumptions commented in the `RPN_BANK_SECT` case above.
-			char const *name = (char const *)expression;
-			while (getRPNByte(expression, size, patch))
-				;
+			char const *name = reinterpret_cast<char const *>(expression);
+			while (getRPNByte(expression, size, patch)) {}
 
 			if (Section const *sect = sect_GetSection(name); !sect) {
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Requested STARTOF() of section \"%s\", which was not found",
-				    name
-				);
-				isError = true;
+				rpnErrorAt(patch, "Requested `STARTOF()` of undefined section \"%s\"", name);
 				value = 1;
 			} else {
 				assume(sect->offset == 0);
@@ -306,8 +372,7 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 		case RPN_SIZEOF_SECTTYPE:
 			value = getRPNByte(expression, size, patch);
 			if (value < 0 || value >= SECTTYPE_INVALID) {
-				error(patch.src, patch.lineNo, "Requested SIZEOF() an invalid section type");
-				isError = true;
+				rpnErrorAt(patch, "Requested `SIZEOF()` of an invalid section type");
 				value = 0;
 			} else {
 				value = sectionTypeInfo[value].size;
@@ -317,8 +382,7 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 		case RPN_STARTOF_SECTTYPE:
 			value = getRPNByte(expression, size, patch);
 			if (value < 0 || value >= SECTTYPE_INVALID) {
-				error(patch.src, patch.lineNo, "Requested STARTOF() an invalid section type");
-				isError = true;
+				rpnErrorAt(patch, "Requested `STARTOF()` of an invalid section type");
 				value = 0;
 			} else {
 				value = sectionTypeInfo[value].startAddr;
@@ -327,9 +391,13 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 
 		case RPN_HRAM:
 			value = popRPN(patch);
-			if (!isError && (value < 0 || (value > 0xFF && value < 0xFF00) || value > 0xFFFF)) {
-				error(patch.src, patch.lineNo, "Value %" PRId32 " is not in HRAM range", value);
-				isError = true;
+			if (value < 0xFF00 || value > 0xFFFF) {
+				firstErrorAt(
+				    patch,
+				    "Address $%" PRIx32 " for `LDH` is not in HRAM range; use `LD` instead",
+				    value
+				);
+				value = 0;
 			}
 			value &= 0xFF;
 			break;
@@ -337,100 +405,125 @@ static int32_t computeRPNExpr(Patch const &patch, std::vector<Symbol> const &fil
 		case RPN_RST:
 			value = popRPN(patch);
 			// Acceptable values are 0x00, 0x08, 0x10, ..., 0x38
-			// They can be easily checked with a bitmask
 			if (value & ~0x38) {
-				if (!isError)
-					error(patch.src, patch.lineNo, "Value %" PRId32 " is not a RST vector", value);
-				isError = true;
+				firstErrorAt(
+				    patch, "Value $%" PRIx32 " is not a `RST` vector; use `CALL` instead", value
+				);
+				value = 0;
 			}
 			value |= 0xC7;
 			break;
 
+		case RPN_BIT_INDEX: {
+			value = popRPN(patch);
+			int32_t mask = getRPNByte(expression, size, patch);
+			// Acceptable values are 0 to 7
+			if (value & ~0x07) {
+				firstErrorAt(patch, "Value $%" PRIx32 " is not a bit index", value);
+				value = 0;
+			}
+			value = mask | (value << 3);
+			break;
+		}
+
 		case RPN_CONST:
 			value = 0;
-			for (uint8_t shift = 0; shift < 32; shift += 8)
+			for (uint8_t shift = 0; shift < 32; shift += 8) {
 				value |= getRPNByte(expression, size, patch) << shift;
-			break;
-
-		case RPN_SYM:
-			value = 0;
-			for (uint8_t shift = 0; shift < 32; shift += 8)
-				value |= getRPNByte(expression, size, patch) << shift;
-
-			if (value == -1) { // PC
-				if (!patch.pcSection) {
-					error(patch.src, patch.lineNo, "PC has no value outside a section");
-					value = 0;
-					isError = true;
-				} else {
-					value = patch.pcOffset + patch.pcSection->org;
-				}
-			} else {
-				if (Symbol const *symbol = getSymbol(fileSymbols, value); !symbol) {
-					error(
-					    patch.src,
-					    patch.lineNo,
-					    "Unknown symbol \"%s\"",
-					    fileSymbols[value].name.c_str()
-					);
-					isError = true;
-				} else if (auto *label = std::get_if<Label>(&symbol->data); label) {
-					value = label->section->org + label->offset;
-				} else {
-					assume(std::holds_alternative<int32_t>(symbol->data));
-					value = std::get<int32_t>(symbol->data);
-				}
 			}
 			break;
+
+		case RPN_SYM: {
+			uint32_t symID = 0;
+			for (uint8_t shift = 0; shift < 32; shift += 8) {
+				symID |= getRPNByte(expression, size, patch) << shift;
+			}
+
+			if (symID == UINT32_MAX) { // PC
+				if (patch.pcSection) {
+					value = patch.pcOffset + patch.pcSection->org;
+				} else {
+					rpnErrorAt(patch, "PC has no value outside of a section");
+					value = 0;
+				}
+			} else if (symID >= fileSymbols.size()) {
+				fatalAt(patch, "Invalid symbol ID #%" PRIu32, symID);
+			} else if (Symbol const *symbol = getSymbol(fileSymbols, symID); !symbol) {
+				rpnErrorAt(patch, "Undefined symbol `%s`", fileSymbols[symID].name.c_str());
+				sym_TraceLocalAliasedSymbols(fileSymbols[symID].name);
+				value = 0;
+			} else if (std::holds_alternative<Label>(symbol->data)) {
+				if (Label const &label = std::get<Label>(symbol->data); !label.section) {
+					rpnErrorAt(
+					    patch,
+					    "Requested value of label `%s` outside of a section",
+					    fileSymbols[symID].name.c_str()
+					);
+					value = 0;
+				} else {
+					value = label.section->org + label.offset;
+				}
+			} else {
+				value = std::get<int32_t>(symbol->data);
+			}
+			break;
+		}
+
+			// LCOV_EXCL_START
+		default:
+			fatalAt(patch, "Invalid RPN command $%02x", static_cast<uint32_t>(command));
+			// LCOV_EXCL_STOP
 		}
 
 		pushRPN(value, isError);
 	}
 
-	if (rpnStack.size() > 1)
-		error(patch.src, patch.lineNo, "RPN stack has %zu entries on exit, not 1", rpnStack.size());
+	if (rpnStack.size() > 1) {
+		rpnErrorAt(patch, "RPN stack has %zu entries on exit, not 1", rpnStack.size());
+	}
 
 	isError = false;
 	return popRPN(patch);
 }
 
+Assertion &patch_AddAssertion() {
+	return assertions.emplace_front();
+}
+
 void patch_CheckAssertions() {
-	verbosePrint("Checking assertions...\n");
+	verbosePrint(VERB_NOTICE, "Checking assertions...\n");
 
 	for (Assertion &assert : assertions) {
 		int32_t value = computeRPNExpr(assert.patch, *assert.fileSymbols);
-		AssertionType type = (AssertionType)assert.patch.type;
+		AssertionType type = static_cast<AssertionType>(assert.patch.type);
 
 		if (!isError && !value) {
 			switch (type) {
 			case ASSERT_FATAL:
-				fatal(
-				    assert.patch.src,
-				    assert.patch.lineNo,
+				fatalAt(
+				    assert.patch,
 				    "%s",
 				    !assert.message.empty() ? assert.message.c_str() : "assert failure"
 				);
 			case ASSERT_ERROR:
-				error(
-				    assert.patch.src,
-				    assert.patch.lineNo,
+				rpnErrorAt(
+				    assert.patch,
 				    "%s",
 				    !assert.message.empty() ? assert.message.c_str() : "assert failure"
 				);
 				break;
 			case ASSERT_WARN:
-				warning(
-				    assert.patch.src,
-				    assert.patch.lineNo,
+				warningAt(
+				    assert.patch,
+				    WARNING_ASSERT,
 				    "%s",
 				    !assert.message.empty() ? assert.message.c_str() : "assert failure"
 				);
 				break;
 			}
 		} else if (isError && type == ASSERT_FATAL) {
-			fatal(
-			    assert.patch.src,
-			    assert.patch.lineNo,
+			fatalAt(
+			    assert.patch,
 			    "Failed to evaluate assertion%s%s",
 			    !assert.message.empty() ? ": " : "",
 			    assert.message.c_str()
@@ -439,55 +532,85 @@ void patch_CheckAssertions() {
 	}
 }
 
-/*
- * Applies all of a section's patches
- * @param section The section component to patch
- * @param dataSection The section to patch
- */
+static void checkPatchSize(Patch const &patch, int32_t v, uint8_t n) {
+	assume(n != 0);                         // That doesn't make sense
+	assume(n < CHAR_BIT * sizeof(int) - 1); // Otherwise `1 << n` is UB
+
+	if (v < -(1 << n) || v >= 1 << n) {
+		diagnosticAt(
+		    patch,
+		    WARNING_TRUNCATION_1,
+		    "Value $%" PRIx32 "%s is not %u-bit",
+		    v,
+		    v < 0 ? " (may be negative?)" : "",
+		    n
+		);
+	} else if (v < -(1 << (n - 1))) {
+		diagnosticAt(
+		    patch,
+		    WARNING_TRUNCATION_2,
+		    "Value $%" PRIx32 "%s is not %u-bit",
+		    v,
+		    v < 0 ? " (may be negative?)" : "",
+		    n
+		);
+	}
+}
+
+// Applies all of a section's patches to a data section
 static void applyFilePatches(Section &section, Section &dataSection) {
-	verbosePrint("Patching section \"%s\"...\n", section.name.c_str());
+	verbosePrint(VERB_INFO, "Patching section \"%s\"...\n", section.name.c_str());
 	for (Patch &patch : section.patches) {
 		int32_t value = computeRPNExpr(patch, *section.fileSymbols);
-		uint16_t offset = patch.offset + section.offset;
+		uint32_t offset = patch.offset + section.offset;
 
-		// `jr` is quite unlike the others...
-		if (patch.type == PATCHTYPE_JR) {
-			// Offset is relative to the byte *after* the operand
-			// PC as operand to `jr` is lower than reference PC by 2
-			uint16_t address = patch.pcSection->org + patch.pcOffset + 2;
-			int16_t jumpOffset = value - address;
+		uint8_t typeSizes[PATCHTYPE_INVALID] = {
+		    1, // PATCHTYPE_BYTE
+		    2, // PATCHTYPE_WORD
+		    4, // PATCHTYPE_LONG
+		    1, // PATCHTYPE_JR
+		};
+		uint8_t typeSize = typeSizes[patch.type];
 
-			if (!isError && (jumpOffset < -128 || jumpOffset > 127))
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "jr target must be between -128 and 127 bytes away, not %" PRId16
-				    "; use jp instead\n",
-				    jumpOffset
-				);
-			dataSection.data[offset] = jumpOffset & 0xFF;
+		if (dataSection.data.size() < offset + typeSize) {
+			rpnErrorAt(
+			    patch,
+			    "Patch would write %zu bytes past the end of section \"%s\" (%zu bytes long)",
+			    offset + typeSize - dataSection.data.size(),
+			    dataSection.name.c_str(),
+			    dataSection.data.size()
+			);
+		} else if (patch.type == PATCHTYPE_JR) {
+			if (!patch.pcSection) {
+				rpnErrorAt(patch, "PC has no value outside of a section");
+				dataSection.data[offset] = 0;
+			} else {
+				// A `jr` is *encoded* in ROM as a 1-byte (8-bit) offset, so here `typeSize == 8`,
+				// but the object's *value* size is a 16-bit absolute address, so we pass 16 here.
+				checkPatchSize(patch, value, 16);
+				// Offset is relative to the byte *after* the operand
+				// PC as operand to `jr` is lower than reference PC by 2
+				uint16_t address = patch.pcSection->org + patch.pcOffset + 2;
+				// The 16-bit truncation of `value - address` is intentional, since
+				// a low ROM0 address may `jr` backwards to a high HRAM one.
+				int16_t jumpOffset = static_cast<int16_t>(value - address);
+
+				if (jumpOffset < -128 || jumpOffset > 127) {
+					firstErrorAt(
+					    patch,
+					    "`JR` target must be between -128 and 127 bytes away, not %" PRId16
+					    "; use `JP` instead",
+					    jumpOffset
+					);
+				}
+				dataSection.data[offset] = jumpOffset & 0xFF;
+			}
 		} else {
 			// Patch a certain number of bytes
-			struct {
-				uint8_t size;
-				int32_t min;
-				int32_t max;
-			} const types[PATCHTYPE_INVALID] = {
-			    {1, -128,      255      }, // PATCHTYPE_BYTE
-			    {2, -32768,    65536    }, // PATCHTYPE_WORD
-			    {4, INT32_MIN, INT32_MAX}, // PATCHTYPE_LONG
-			};
-
-			if (!isError && (value < types[patch.type].min || value > types[patch.type].max))
-				error(
-				    patch.src,
-				    patch.lineNo,
-				    "Value %" PRId32 "%s is not %u-bit",
-				    value,
-				    value < 0 ? " (maybe negative?)" : "",
-				    types[patch.type].size * 8U
-				);
-			for (uint8_t i = 0; i < types[patch.type].size; i++) {
+			if (typeSize < sizeof(int)) {
+				checkPatchSize(patch, value, typeSize * 8);
+			}
+			for (uint8_t i = 0; i < typeSize; ++i) {
 				dataSection.data[offset + i] = value & 0xFF;
 				value >>= 8;
 			}
@@ -495,16 +618,15 @@ static void applyFilePatches(Section &section, Section &dataSection) {
 	}
 }
 
-/*
- * Applies all of a section's patches, iterating over "components" of unionized sections
- * @param section The section to patch
- */
+// Applies all of a section's patches, iterating over "pieces" of unionized sections
 static void applyPatches(Section &section) {
-	if (!sect_HasData(section.type))
+	if (!sectTypeHasData(section.type)) {
 		return;
+	}
 
-	for (Section *component = &section; component; component = component->nextu.get())
-		applyFilePatches(*component, section);
+	for (Section &piece : section.pieces()) {
+		applyFilePatches(piece, section);
+	}
 }
 
 void patch_ApplyPatches() {

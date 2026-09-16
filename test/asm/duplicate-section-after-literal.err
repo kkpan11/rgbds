@@ -1,0 +1,4 @@
+FATAL: Section "dup" already defined
+    at duplicate-section-after-literal.asm(7)
+    and also:
+    at duplicate-section-after-literal.asm(5)

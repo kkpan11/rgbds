@@ -1,3 +1,3 @@
-SECTION "sec", ROM0
+SECTION "Test", ROM0
 
 dw .test

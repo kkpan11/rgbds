@@ -1,13 +1,179 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 #include "util.hpp"
 
-#include <ctype.h>
+#include <errno.h>
+#include <optional>
 #include <stdint.h>
 #include <stdio.h>
-#include <vector>
+#include <string.h> // strspn
 
-#include "extern/utf8decoder.hpp"
+#include "helpers.hpp" // assume
+#include "platform.hpp"
+
+int xfclose(FILE *file) {
+	if (file == stdin || file == stdout || file == stderr) {
+		return 0;
+	}
+	return fclose(file);
+}
+
+int xclose(int fd) {
+	if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+		return 0;
+	}
+	return close(fd);
+}
+
+std::optional<uint64_t> seekSize(FILE *file) {
+	if (fseek(file, 0, SEEK_END) != 0) {
+		return std::nullopt;
+	}
+	auto size = ftell(file); // Use `auto` since Windows' `_ftelli64` returns `__int64`, not `long`
+	if (size < 0) {
+		return std::nullopt;
+	}
+	if (fseek(file, 0, SEEK_SET) != 0) {
+		return std::nullopt;
+	}
+	return static_cast<uint64_t>(size);
+}
+
+bool isNewline(int c) {
+	return c == '\r' || c == '\n';
+}
+
+bool isBlankSpace(int c) {
+	return c == ' ' || c == '\t';
+}
+
+bool isWhitespace(int c) {
+	return isBlankSpace(c) || isNewline(c);
+}
+
+bool isPrintable(int c) {
+	return c >= ' ' && c <= '~';
+}
+
+bool isUpper(int c) {
+	return c >= 'A' && c <= 'Z';
+}
+
+bool isLower(int c) {
+	return c >= 'a' && c <= 'z';
+}
+
+bool isLetter(int c) {
+	return isUpper(c) || isLower(c);
+}
+
+bool isAlphanumeric(int c) {
+	return isLetter(c) || isDigit<10>(c);
+}
+
+char toLower(char c) {
+	return isUpper(c) ? c - 'A' + 'a' : c;
+}
+
+char toUpper(char c) {
+	return isLower(c) ? c - 'a' + 'A' : c;
+}
+
+bool startsIdentifier(int c) {
+	// This returns false for anonymous labels, which internally start with a '!',
+	// and for section fragment literal labels, which internally start with a '$'.
+	return isLetter(c) || c == '.' || c == '_';
+}
+
+bool continuesIdentifier(int c) {
+	return startsIdentifier(c) || isDigit<10>(c) || c == '#' || c == '$' || c == '@';
+}
+
+// Parses a number from a string, moving the pointer to skip the parsed characters.
+std::optional<uint64_t> parseNumber(char const *&str, NumberBase base) {
+	// Identify the base if not specified
+	// Does *not* support '+' or '-' sign prefix (unlike `strtoul` and `std::from_chars`)
+	if (base == BASE_AUTO) {
+		base = BASE_10;
+
+		// Skips leading blank space (like `strtoul`)
+		str += strspn(str, " \t");
+
+		// Supports traditional ("0b", "0o", "0x") and RGBASM ('%', '&', '$') base prefixes
+		switch (str[0]) {
+		case '%':
+			base = BASE_2;
+			++str;
+			break;
+		case '&':
+			base = BASE_8;
+			++str;
+			break;
+		case '$':
+			base = BASE_16;
+			++str;
+			break;
+		case '0':
+			switch (str[1]) {
+			case 'B':
+			case 'b':
+				base = BASE_2;
+				str += 2;
+				break;
+			case 'O':
+			case 'o':
+				base = BASE_8;
+				str += 2;
+				break;
+			case 'X':
+			case 'x':
+				base = BASE_16;
+				str += 2;
+				break;
+			}
+			break;
+		}
+	}
+
+	// Get the digit-condition function corresponding to the base
+	bool (*isSomeDigit)(int c) = base == BASE_2    ? isDigit<2>
+	                             : base == BASE_8  ? isDigit<8>
+	                             : base == BASE_10 ? isDigit<10>
+	                             : base == BASE_16 ? isDigit<16>
+	                                               : nullptr; // LCOV_EXCL_LINE
+	assume(isSomeDigit != nullptr);
+
+	char const * const startDigits = str;
+
+	// Parse the number one digit at a time
+	// Does *not* support '_' digit separators
+	uint64_t result = 0;
+	for (; isSomeDigit(str[0]); ++str) {
+		uint8_t digit = parseDigit<16>(str[0]);
+		if (result > (UINT64_MAX - digit) / base) {
+			// Skip remaining digits and set errno = ERANGE on overflow
+			while (isSomeDigit(str[0])) {
+				++str;
+			}
+			result = UINT64_MAX;
+			errno = ERANGE;
+			break;
+		}
+		result = result * base + digit;
+	}
+
+	// Return the parsed number if there were any digit characters
+	if (str - startDigits == 0) {
+		return std::nullopt;
+	}
+	return result;
+}
+
+// Parses a number from an entire string, returning nothing if there are more unparsed characters.
+std::optional<uint64_t> parseWholeNumber(char const *str, NumberBase base) {
+	std::optional<uint64_t> result = parseNumber(str, base);
+	return str[0] == '\0' ? result : std::nullopt;
+}
 
 char const *printChar(int c) {
 	// "'A'" + '\0': 4 bytes
@@ -15,10 +181,12 @@ char const *printChar(int c) {
 	// "0xFF" + '\0': 5 bytes
 	static char buf[5];
 
-	if (c == EOF)
+	if (c == EOF) {
 		return "EOF";
+	}
 
-	if (isprint(c)) {
+	// Handle printable ASCII characters
+	if (isPrintable(c)) {
 		buf[0] = '\'';
 		buf[1] = c;
 		buf[2] = '\'';
@@ -43,7 +211,7 @@ char const *printChar(int c) {
 	default: // Print as hex
 		buf[0] = '0';
 		buf[1] = 'x';
-		snprintf(&buf[2], 3, "%02hhX", (uint8_t)c); // includes the '\0'
+		snprintf(&buf[2], 3, "%02hhX", static_cast<uint8_t>(c)); // includes the '\0'
 		return buf;
 	}
 	buf[0] = '\'';
@@ -51,21 +219,4 @@ char const *printChar(int c) {
 	buf[3] = '\'';
 	buf[4] = '\0';
 	return buf;
-}
-
-size_t readUTF8Char(std::vector<uint8_t> *dest, char const *src) {
-	uint32_t state = 0, codepoint;
-	size_t i = 0;
-
-	for (;;) {
-		if (decode(&state, &codepoint, src[i]) == 1)
-			return 0;
-
-		if (dest)
-			dest->push_back(src[i]);
-		i++;
-
-		if (state == 0)
-			return i;
-	}
 }

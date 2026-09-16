@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 // Contains some assembler-wide defines and externs
 
@@ -15,6 +15,7 @@
 
 #include "linkdefs.hpp"
 
+#include "asm/intern.hpp"
 #include "asm/lexer.hpp"
 
 struct FileStackNode {
@@ -24,61 +25,64 @@ struct FileStackNode {
 	    std::string            // NODE_FILE, NODE_MACRO
 	    >
 	    data;
+	bool isQuiet; // Whether to omit this node from error reporting
 
 	std::shared_ptr<FileStackNode> parent; // Pointer to parent node, for error reporting
 	// Line at which the parent context was exited
 	// Meaningless at the root level, but gets written to the object file anyway, so init it
 	uint32_t lineNo = 0;
 
-	// Set only if referenced: ID within the object file, -1 if not output yet
-	uint32_t ID = -1;
+	// Set only if referenced: ID within the object file, `UINT32_MAX` if not output yet
+	uint32_t ID = UINT32_MAX;
 
 	// REPT iteration counts since last named node, in reverse depth order
-	std::vector<uint32_t> &iters();
-	std::vector<uint32_t> const &iters() const;
+	std::vector<uint32_t> &iters() { return std::get<std::vector<uint32_t>>(data); }
+	std::vector<uint32_t> const &iters() const { return std::get<std::vector<uint32_t>>(data); }
 	// File name for files, file::macro name for macros
-	std::string &name();
-	std::string const &name() const;
+	std::string &name() { return std::get<std::string>(data); }
+	std::string const &name() const { return std::get<std::string>(data); }
 
-	FileStackNode(FileStackNodeType type_, std::variant<std::vector<uint32_t>, std::string> data_)
-	    : type(type_), data(data_){};
+	FileStackNode(
+	    FileStackNodeType type_,
+	    std::variant<std::vector<uint32_t>, std::string> data_,
+	    bool isQuiet_
+	)
+	    : type(type_), data(data_), isQuiet(isQuiet_) {}
 
-	std::string const &dump(uint32_t curLineNo) const;
-
-	// If true, entering this context generates a new unique ID.
-	bool generatesUniqueID() const { return type == NODE_REPT || type == NODE_MACRO; }
+	void printBacktrace(uint32_t curLineNo) const;
 };
-
-#define DEFAULT_MAX_DEPTH 64
-extern size_t maxRecursionDepth;
 
 struct MacroArgs;
 
-void fstk_DumpCurrent();
+void fstk_VerboseOutputConfig();
+
+void fstk_TraceCurrent();
 std::shared_ptr<FileStackNode> fstk_GetFileStack();
 std::shared_ptr<std::string> fstk_GetUniqueIDStr();
 MacroArgs *fstk_GetCurrentMacroArgs();
 
 void fstk_AddIncludePath(std::string const &path);
-void fstk_SetPreIncludeFile(std::string const &path);
+void fstk_AddPreIncludeFile(std::string const &path);
 std::optional<std::string> fstk_FindFile(std::string const &path);
+bool fstk_FileError(std::string const &path, char const *description);
+bool fstk_FailedOnMissingInclude();
 
 bool yywrap();
-void fstk_RunInclude(std::string const &path, bool updateStateNow);
-void fstk_RunMacro(std::string const &macroName, std::shared_ptr<MacroArgs> macroArgs);
-void fstk_RunRept(uint32_t count, int32_t reptLineNo, ContentSpan const &span);
+bool fstk_RunInclude(std::string const &path, bool isQuiet);
+void fstk_RunMacro(InternedStr macroName, std::shared_ptr<MacroArgs> macroArgs, bool isQuiet);
+void fstk_RunRept(uint32_t count, int32_t reptLineNo, ContentSpan const &span, bool isQuiet);
 void fstk_RunFor(
-    std::string const &symName,
+    InternedStr symName,
     int32_t start,
     int32_t stop,
     int32_t step,
     int32_t reptLineNo,
-    ContentSpan const &span
+    ContentSpan const &span,
+    bool isQuiet
 );
-void fstk_StopRept();
 bool fstk_Break();
 
 void fstk_NewRecursionDepth(size_t newDepth);
-void fstk_Init(std::string const &mainPath, size_t maxDepth);
+bool fstk_Init(std::string const &mainPath);
 
 #endif // RGBDS_ASM_FSTACK_HPP

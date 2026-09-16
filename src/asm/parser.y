@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+// SPDX-License-Identifier: MIT
 
 %language "c++"
 %define api.value.type variant
@@ -10,17 +10,13 @@
 	#include <variant>
 	#include <vector>
 
+	#include "linkdefs.hpp"
+
+	#include "asm/actions.hpp"
 	#include "asm/lexer.hpp"
 	#include "asm/macro.hpp"
 	#include "asm/rpn.hpp"
 	#include "asm/section.hpp"
-
-	#include "linkdefs.hpp"
-
-	struct AlignmentSpec {
-		uint8_t alignment;
-		uint16_t alignOfs;
-	};
 
 	struct ForArgs {
 		int32_t start;
@@ -31,29 +27,25 @@
 	struct StrFmtArgList {
 		std::string format;
 		std::vector<std::variant<uint32_t, std::string>> args;
-
-		StrFmtArgList() = default;
-		StrFmtArgList(StrFmtArgList &&) = default;
-	#ifdef _MSC_VER
-		// MSVC and WinFlexBison won't build without this...
-		StrFmtArgList(StrFmtArgList const &) = default;
-	#endif
-
-		StrFmtArgList &operator=(StrFmtArgList &&) = default;
 	};
 }
+
 %code {
 	#include <algorithm>
-	#include <ctype.h>
+	#include <concepts> // invocable
 	#include <inttypes.h>
+	#include <optional>
 	#include <stdio.h>
 	#include <stdlib.h>
 	#include <string.h>
 	#include <string_view>
 
+	#include "extern/utf8decoder.hpp"
+	#include "helpers.hpp"
+	#include "util.hpp" // toLower, toUpper
+
 	#include "asm/charmap.hpp"
 	#include "asm/fixpoint.hpp"
-	#include "asm/format.hpp"
 	#include "asm/fstack.hpp"
 	#include "asm/main.hpp"
 	#include "asm/opt.hpp"
@@ -62,31 +54,23 @@
 	#include "asm/symbol.hpp"
 	#include "asm/warning.hpp"
 
-	#include "extern/utf8decoder.hpp"
-
-	#include "helpers.hpp"
-
 	using namespace std::literals;
 
 	yy::parser::symbol_type yylex(); // Provided by lexer.cpp
 
-	static uint32_t str2int2(std::vector<uint8_t> const &s);
-	static void errorInvalidUTF8Byte(uint8_t byte, char const *functionName);
-	static size_t strlenUTF8(std::string const &str);
-	static std::string strsubUTF8(std::string const &str, uint32_t pos, uint32_t len);
-	static size_t charlenUTF8(std::string const &str);
-	static std::string charsubUTF8(std::string const &str, uint32_t pos);
-	static uint32_t adjustNegativePos(int32_t pos, size_t len, char const *functionName);
-	static std::string strrpl(
-	    std::string_view str, std::string const &old, std::string const &rep
-	);
-	static std::string strfmt(
-	    std::string const &spec,
-	    std::vector<std::variant<uint32_t, std::string>> const &args
-	);
-	static void compoundAssignment(std::string const &symName, RPNCommand op, int32_t constValue);
-	static void failAssert(AssertionType type);
-	static void failAssertMsg(AssertionType type, std::string const &message);
+	static auto handleSymbolByType(
+	    InternedStr symName,
+	    std::invocable<Expression const &> auto numCallback,
+	    std::invocable<std::string const &> auto strCallback
+	) {
+		if (Symbol *sym = sym_FindScopedSymbol(symName); sym && sym->type == SYM_EQUS) {
+			return strCallback(*sym->getEqus());
+		} else {
+			Expression expr;
+			expr.makeSymbol(symName);
+			return numCallback(expr);
+		}
+	}
 
 	// The CPU encodes instructions in a logical way, so most instructions actually follow patterns.
 	// These enums thus help with bit twiddling to compute opcodes.
@@ -96,225 +80,337 @@
 
 	// REG_AF == REG_SP since LD/INC/ADD/DEC allow SP, while PUSH/POP allow AF
 	enum { REG_BC, REG_DE, REG_HL, REG_SP, REG_AF = REG_SP };
+	// Names are not needed for AF or SP
+	static char const *reg_tt_names[] = { "BC", "DE", "HL" };
+	static char const *reg_tt_high_names[] = { "B", "D", "H" };
+	static char const *reg_tt_low_names[] = { "C", "E", "L" };
 
 	// CC_NZ == CC_Z ^ 1, and CC_NC == CC_C ^ 1, so `!` can toggle them
 	enum { CC_NZ, CC_Z, CC_NC, CC_C };
 }
 
-%type <Expression> relocexpr
-%type <Expression> relocexpr_no_str
-%type <int32_t> const
-%type <int32_t> const_no_str
-%type <int32_t> const_8bit
-%type <int32_t> uconst
-%type <int32_t> rs_uconst
-%type <int32_t> shift_const
-%type <int32_t> bit_const
-%type <Expression> reloc_8bit
-%type <Expression> reloc_8bit_no_str
-%type <Expression> reloc_8bit_offset
-%type <Expression> reloc_16bit
-%type <Expression> reloc_16bit_no_str
-%type <int32_t> sect_type
+/******************** Tokens ********************/
 
-%type <std::string> string
-%type <std::string> strcat_args
-%type <StrFmtArgList> strfmt_args
-%type <StrFmtArgList> strfmt_va_args
+%token YYEOF 0 "end of file"
+%token NEWLINE "end of line"
+%token EOB "end of buffer"
+%token EOL "end of fragment literal"
 
-%type <int32_t> sect_org
-%type <SectionSpec> sect_attrs
-
-%token <int32_t> NUMBER "number"
-%token <std::string> STRING "string"
-
-%token PERIOD "."
+// General punctuation
 %token COMMA ","
 %token COLON ":" DOUBLE_COLON "::"
 %token LBRACK "[" RBRACK "]"
+%token LBRACKS "[[" RBRACKS "]]"
 %token LPAREN "(" RPAREN ")"
-%token NEWLINE "newline"
+%token QUESTIONMARK "?"
 
-%token OP_LOGICNOT "!"
-%token OP_LOGICAND "&&" OP_LOGICOR "||"
-%token OP_LOGICGT ">" OP_LOGICLT "<"
-%token OP_LOGICGE ">=" OP_LOGICLE "<="
-%token OP_LOGICNE "!=" OP_LOGICEQU "=="
+// Arithmetic operators
 %token OP_ADD "+" OP_SUB "-"
-%token OP_OR "|" OP_XOR "^" OP_AND "&"
-%token OP_SHL "<<" OP_SHR ">>" OP_USHR ">>>"
 %token OP_MUL "*" OP_DIV "/" OP_MOD "%"
+%token OP_EXP "**"
+
+// String operators
+%token OP_CAT "++"
+%token OP_STREQU "===" OP_STRNE "!=="
+
+// Comparison operators
+%token OP_LOGICEQU "==" OP_LOGICNE "!="
+%token OP_LOGICLT "<" OP_LOGICGT ">"
+%token OP_LOGICLE "<=" OP_LOGICGE ">="
+
+// Logical operators
+%token OP_LOGICAND "&&" OP_LOGICOR "||"
+%token OP_LOGICNOT "!"
+
+// Binary operators
+%token OP_AND "&" OP_OR "|" OP_XOR "^"
+%token OP_SHL "<<" OP_SHR ">>" OP_USHR ">>>"
 %token OP_NOT "~"
+
+// Operator precedence
 %left OP_LOGICOR
 %left OP_LOGICAND
-%left OP_LOGICGT OP_LOGICLT OP_LOGICGE OP_LOGICLE OP_LOGICNE OP_LOGICEQU
+%left OP_LOGICEQU OP_LOGICNE OP_LOGICLT OP_LOGICGT OP_LOGICLE OP_LOGICGE
 %left OP_ADD OP_SUB
-%left OP_OR OP_XOR OP_AND
+%left OP_AND OP_OR OP_XOR
 %left OP_SHL OP_SHR OP_USHR
 %left OP_MUL OP_DIV OP_MOD
+%left OP_CAT
+%precedence NEG // applies to unary OP_LOGICNOT, OP_ADD, OP_SUB, OP_NOT
+%right OP_EXP
 
-%precedence NEG // negation -- unary minus
-
-%token OP_EXP "**"
-%left OP_EXP
-
-%token OP_DEF "DEF"
-%token OP_BANK "BANK"
-%token OP_ALIGN "ALIGN"
-%token OP_SIZEOF "SIZEOF" OP_STARTOF "STARTOF"
-
-%token OP_SIN "SIN" OP_COS "COS" OP_TAN "TAN"
-%token OP_ASIN "ASIN" OP_ACOS "ACOS" OP_ATAN "ATAN" OP_ATAN2 "ATAN2"
-%token OP_FDIV "FDIV"
-%token OP_FMUL "FMUL"
-%token OP_FMOD "FMOD"
-%token OP_POW "POW"
-%token OP_LOG "LOG"
-%token OP_ROUND "ROUND"
-%token OP_CEIL "CEIL" OP_FLOOR "FLOOR"
-%type <int32_t> opt_q_arg
-
-%token OP_HIGH "HIGH" OP_LOW "LOW"
-%token OP_ISCONST "ISCONST"
-
-%token OP_STRCMP "STRCMP"
-%token OP_STRIN "STRIN" OP_STRRIN "STRRIN"
-%token OP_STRSUB "STRSUB"
-%token OP_STRLEN "STRLEN"
-%token OP_STRCAT "STRCAT"
-%token OP_STRUPR "STRUPR" OP_STRLWR "STRLWR"
-%token OP_STRRPL "STRRPL"
-%token OP_STRFMT "STRFMT"
-
-%token OP_CHARLEN "CHARLEN"
-%token OP_CHARSUB "CHARSUB"
-%token OP_INCHARMAP "INCHARMAP"
-
-%token <std::string> LABEL "label"
-%token <std::string> ID "identifier"
-%token <std::string> LOCAL_ID "local identifier"
-%token <std::string> ANON "anonymous label"
-%type <std::string> def_id
-%type <std::string> redef_id
-%type <std::string> def_numeric
-%type <std::string> def_equ
-%type <std::string> redef_equ
-%type <std::string> def_set
-%type <std::string> def_rb
-%type <std::string> def_rw
-%type <std::string> def_rl
-%type <std::string> def_equs
-%type <std::string> redef_equs
-%type <std::string> scoped_id
-%type <std::string> scoped_anon_id
-%token POP_EQU "EQU"
+// Assignment operators (only for variables)
 %token POP_EQUAL "="
-%token POP_EQUS "EQUS"
-
 %token POP_ADDEQ "+=" POP_SUBEQ "-="
 %token POP_MULEQ "*=" POP_DIVEQ "/=" POP_MODEQ "%="
-%token POP_OREQ "|=" POP_XOREQ "^=" POP_ANDEQ "&="
+%token POP_ANDEQ "&=" POP_OREQ "|=" POP_XOREQ "^="
 %token POP_SHLEQ "<<=" POP_SHREQ ">>="
-%type <RPNCommand> compound_eq
 
-%token POP_INCLUDE "INCLUDE"
-%token POP_PRINT "PRINT" POP_PRINTLN "PRINTLN"
-%token POP_IF "IF" POP_ELIF "ELIF" POP_ELSE "ELSE" POP_ENDC "ENDC"
-%token POP_EXPORT "EXPORT"
-%token POP_DB "DB" POP_DS "DS" POP_DW "DW" POP_DL "DL"
-%token POP_SECTION "SECTION" POP_FRAGMENT "FRAGMENT"
-%token POP_ENDSECTION "ENDSECTION"
-%token POP_RB "RB" POP_RW "RW" // There is no POP_RL, only Z80_RL
-%token POP_MACRO "MACRO"
-%token POP_ENDM "ENDM"
-%token POP_RSRESET "RSRESET" POP_RSSET "RSSET"
-%token POP_UNION "UNION" POP_NEXTU "NEXTU" POP_ENDU "ENDU"
-%token POP_INCBIN "INCBIN" POP_REPT "REPT" POP_FOR "FOR"
-%token POP_CHARMAP "CHARMAP"
-%token POP_NEWCHARMAP "NEWCHARMAP"
-%token POP_SETCHARMAP "SETCHARMAP"
-%token POP_PUSHC "PUSHC"
-%token POP_POPC "POPC"
-%token POP_SHIFT "SHIFT"
-%token POP_ENDR "ENDR"
-%token POP_BREAK "BREAK"
-%token POP_LOAD "LOAD" POP_ENDL "ENDL"
-%token POP_FAIL "FAIL"
-%token POP_WARN "WARN"
-%token POP_FATAL "FATAL"
-%token POP_ASSERT "ASSERT" POP_STATIC_ASSERT "STATIC_ASSERT"
-%token POP_PURGE "PURGE"
-%token POP_REDEF "REDEF"
-%token POP_POPS "POPS"
-%token POP_PUSHS "PUSHS"
-%token POP_POPO "POPO"
-%token POP_PUSHO "PUSHO"
-%token POP_OPT "OPT"
-%token SECT_ROM0 "ROM0" SECT_ROMX "ROMX"
-%token SECT_WRAM0 "WRAM0" SECT_WRAMX "WRAMX" SECT_HRAM "HRAM"
-%token SECT_VRAM "VRAM" SECT_SRAM "SRAM" SECT_OAM "OAM"
-
-%type <Capture> capture_rept
-%type <Capture> capture_macro
-
-%type <SectionModifier> sect_mod
-%type <std::shared_ptr<MacroArgs>> macro_args
-
-%type <AlignmentSpec> align_spec
-
-%type <std::vector<Expression>> ds_args
-%type <std::vector<std::string>> purge_args
-%type <ForArgs> for_args
-
-%token Z80_ADC "adc" Z80_ADD "add" Z80_AND "and"
-%token Z80_BIT "bit"
-%token Z80_CALL "call" Z80_CCF "ccf" Z80_CP "cp" Z80_CPL "cpl"
-%token Z80_DAA "daa" Z80_DEC "dec" Z80_DI "di"
-%token Z80_EI "ei"
-%token Z80_HALT "halt"
-%token Z80_INC "inc"
-%token Z80_JP "jp" Z80_JR "jr"
-%token Z80_LD "ld"
-%token Z80_LDI "ldi"
-%token Z80_LDD "ldd"
-%token Z80_LDH "ldh"
-%token Z80_NOP "nop"
-%token Z80_OR "or"
-%token Z80_POP "pop" Z80_PUSH "push"
-%token Z80_RES "res" Z80_RET "ret" Z80_RETI "reti" Z80_RST "rst"
-%token Z80_RL "rl" Z80_RLA "rla" Z80_RLC "rlc" Z80_RLCA "rlca"
-%token Z80_RR "rr" Z80_RRA "rra" Z80_RRC "rrc" Z80_RRCA "rrca"
-%token Z80_SBC "sbc" Z80_SCF "scf" Z80_SET "set" Z80_STOP "stop"
-%token Z80_SLA "sla" Z80_SRA "sra" Z80_SRL "srl" Z80_SUB "sub"
-%token Z80_SWAP "swap"
-%token Z80_XOR "xor"
-
+// SM83 registers
 %token TOKEN_A "a"
 %token TOKEN_B "b" TOKEN_C "c"
 %token TOKEN_D "d" TOKEN_E "e"
 %token TOKEN_H "h" TOKEN_L "l"
-%token MODE_AF "af" MODE_BC "bc" MODE_DE "de" MODE_SP "sp"
-%token MODE_HL "hl" MODE_HL_DEC "hld/hl-" MODE_HL_INC "hli/hl+"
-%token CC_NZ "nz" CC_Z "z" CC_NC "nc" // There is no CC_C, only TOKEN_C
+%token MODE_AF "af" MODE_BC "bc" MODE_DE "de" MODE_HL "hl" MODE_SP "sp"
+%token MODE_HL_INC "hli/hl+" MODE_HL_DEC "hld/hl-"
 
+// SM83 condition codes
+%token CC_Z "z" CC_NZ "nz" CC_NC "nc" // There is no CC_C, only TOKEN_C
+
+// SM83 instructions
+%token SM83_ADC "adc"
+%token SM83_ADD "add"
+%token SM83_AND "and"
+%token SM83_BIT "bit"
+%token SM83_CALL "call"
+%token SM83_CCF "ccf"
+%token SM83_CP "cp"
+%token SM83_CPL "cpl"
+%token SM83_DAA "daa"
+%token SM83_DEC "dec"
+%token SM83_DI "di"
+%token SM83_EI "ei"
+%token SM83_HALT "halt"
+%token SM83_INC "inc"
+%token SM83_JP "jp"
+%token SM83_JR "jr"
+%token SM83_LDD "ldd"
+%token SM83_LDH "ldh"
+%token SM83_LDI "ldi"
+%token SM83_LD "ld"
+%token SM83_NOP "nop"
+%token SM83_OR "or"
+%token SM83_POP "pop"
+%token SM83_PUSH "push"
+%token SM83_RES "res"
+%token SM83_RETI "reti"
+%token SM83_RET "ret"
+%token SM83_RLA "rla"
+%token SM83_RLCA "rlca"
+%token SM83_RLC "rlc"
+%token SM83_RL "rl"
+%token SM83_RRA "rra"
+%token SM83_RRCA "rrca"
+%token SM83_RRC "rrc"
+%token SM83_RR "rr"
+%token SM83_RST "rst"
+%token SM83_SBC "sbc"
+%token SM83_SCF "scf"
+%token SM83_SET "set"
+%token SM83_SLA "sla"
+%token SM83_SRA "sra"
+%token SM83_SRL "srl"
+%token SM83_STOP "stop"
+%token SM83_SUB "sub"
+%token SM83_SWAP "swap"
+%token SM83_XOR "xor"
+
+// Statement keywords
+%token POP_ALIGN "ALIGN"
+%token POP_ASSERT "ASSERT"
+%token POP_BREAK "BREAK"
+%token POP_CHARMAP "CHARMAP"
+%token POP_DB "DB"
+%token POP_DL "DL"
+%token POP_DS "DS"
+%token POP_DW "DW"
+%token POP_ELIF "ELIF"
+%token POP_ELSE "ELSE"
+%token POP_ENDC "ENDC"
+%token POP_ENDL "ENDL"
+%token POP_ENDM "ENDM"
+%token POP_ENDR "ENDR"
+%token POP_ENDSECTION "ENDSECTION"
+%token POP_ENDU "ENDU"
+%token POP_EQU "EQU"
+%token POP_EQUS "EQUS"
+%token POP_EXPORT "EXPORT"
+%token POP_FAIL "FAIL"
+%token POP_FATAL "FATAL"
+%token POP_FOR "FOR"
+%token POP_FRAGMENT "FRAGMENT"
+%token POP_IF "IF"
+%token POP_INCBIN "INCBIN"
+%token POP_INCLUDE "INCLUDE"
+%token POP_LOAD "LOAD"
+%token POP_MACRO "MACRO"
+%token POP_NEWCHARMAP "NEWCHARMAP"
+%token POP_NEXTU "NEXTU"
+%token POP_OPT "OPT"
+%token POP_POPC "POPC"
+%token POP_POPO "POPO"
+%token POP_POPS "POPS"
+%token POP_PRINTLN "PRINTLN"
+%token POP_PRINT "PRINT"
+%token POP_PURGE "PURGE"
+%token POP_PUSHC "PUSHC"
+%token POP_PUSHO "PUSHO"
+%token POP_PUSHS "PUSHS"
+%token POP_RB "RB"
+%token POP_REDEF "REDEF"
+%token POP_REPT "REPT"
+%token POP_RSRESET "RSRESET"
+%token POP_RSSET "RSSET"
+// There is no POP_RL, only SM83_RL
+%token POP_RW "RW"
+%token POP_SECTION "SECTION"
+%token POP_SETCHARMAP "SETCHARMAP"
+%token POP_SHIFT "SHIFT"
+%token POP_STATIC_ASSERT "STATIC_ASSERT"
+%token POP_UNION "UNION"
+%token POP_WARN "WARN"
+
+// Function keywords
+%token OP_ACOS "ACOS"
+%token OP_ASIN "ASIN"
+%token OP_ATAN "ATAN"
+%token OP_ATAN2 "ATAN2"
+%token OP_BANK "BANK"
+%token OP_BITWIDTH "BITWIDTH"
+%token OP_BYTELEN "BYTELEN"
+%token OP_CEIL "CEIL"
+%token OP_CHARCMP "CHARCMP"
+%token OP_CHARLEN "CHARLEN"
+%token OP_CHARSIZE "CHARSIZE"
+%token OP_CHARSUB "CHARSUB"
+%token OP_CHARVAL "CHARVAL"
+%token OP_COS "COS"
+%token OP_DEF "DEF"
+%token OP_FDIV "FDIV"
+%token OP_FLOOR "FLOOR"
+%token OP_FMOD "FMOD"
+%token OP_FMUL "FMUL"
+%token OP_HIGH "HIGH"
+%token OP_INCHARMAP "INCHARMAP"
+%token OP_ISCONST "ISCONST"
+%token OP_LOG "LOG"
+%token OP_LOW "LOW"
+%token OP_POW "POW"
+%token OP_READFILE "READFILE"
+%token OP_REVCHAR "REVCHAR"
+%token OP_ROUND "ROUND"
+%token OP_SIN "SIN"
+%token OP_SIZEOF "SIZEOF"
+%token OP_STARTOF "STARTOF"
+%token OP_STRBYTE "STRBYTE"
+%token OP_STRCAT "STRCAT"
+%token OP_STRCHAR "STRCHAR"
+%token OP_STRCMP "STRCMP"
+%token OP_STRFIND "STRFIND"
+%token OP_STRFMT "STRFMT"
+%token OP_STRIN "STRIN"
+%token OP_STRLEN "STRLEN"
+%token OP_STRLWR "STRLWR"
+%token OP_STRRFIND "STRRFIND"
+%token OP_STRRIN "STRRIN"
+%token OP_STRRPL "STRRPL"
+%token OP_STRSLICE "STRSLICE"
+%token OP_STRSUB "STRSUB"
+%token OP_STRUPR "STRUPR"
+%token OP_TAN "TAN"
+%token OP_TZCOUNT "TZCOUNT"
+
+// Section types
+%token SECT_HRAM "HRAM"
+%token SECT_OAM "OAM"
+%token SECT_ROM0 "ROM0"
+%token SECT_ROMX "ROMX"
+%token SECT_SRAM "SRAM"
+%token SECT_VRAM "VRAM"
+%token SECT_WRAM0 "WRAM0"
+%token SECT_WRAMX "WRAMX"
+
+// Literals
+%token <int32_t> NUMBER "number"
+%token <std::string> STRING "string"
+%token <std::string> CHARACTER "character"
+%token <InternedStr> SYMBOL "symbol"
+%token <InternedStr> LABEL "label"
+%token <InternedStr> LOCAL "local label"
+%token <InternedStr> ANON "anonymous label"
+%token <InternedStr> QMACRO "quiet macro"
+
+/******************** Data types ********************/
+
+// RPN expressions
+%type <Expression> relocexpr
+// `relocexpr_no_str` exists because strings usually count as numeric expressions, but some
+// contexts treat numbers and strings differently, e.g. `db "string"` or `print "string"`.
+%type <Expression> relocexpr_no_str
+%type <Expression> reloc_3bit
+%type <Expression> reloc_8bit
+%type <Expression> reloc_16bit
+%type <Expression> reloc_8bit_signed
+
+// Constant numbers
+%type <int32_t> iconst
+%type <int32_t> uconst
+// Constant numbers used only in specific contexts
+%type <int32_t> precision_arg
+%type <int32_t> rs_uconst
+%type <int32_t> sect_org
+%type <int32_t> shift_const
+
+// Strings
+%type <std::string> string
+%type <std::string> string_literal
+%type <std::string> strcat_args
+// Strings used for identifiers
+%type <InternedStr> def_id
+%type <InternedStr> redef_id
+%type <InternedStr> def_numeric
+%type <InternedStr> def_equ
+%type <InternedStr> redef_equ
+%type <InternedStr> def_set
+%type <InternedStr> def_rb
+%type <InternedStr> def_rw
+%type <InternedStr> def_rl
+%type <InternedStr> def_equs
+%type <InternedStr> redef_equs
+%type <InternedStr> scoped_sym
+// `scoped_sym_no_anon` exists because anonymous labels usually count as "scoped symbols", but some
+// contexts treat anonymous labels and other labels/symbols differently, e.g. `purge` or `export`.
+%type <InternedStr> scoped_sym_no_anon
+%type <InternedStr> fragment_literal
+%type <InternedStr> fragment_literal_name
+
+// SM83 instruction parameters
 %type <int32_t> reg_r
 %type <int32_t> reg_r_no_a
 %type <int32_t> reg_a
 %type <int32_t> reg_ss
 %type <int32_t> reg_rr
 %type <int32_t> reg_tt
+%type <int32_t> reg_tt_no_af
+%type <int32_t> reg_bc_or_de
 %type <int32_t> ccode_expr
 %type <int32_t> ccode
 %type <Expression> op_a_n
 %type <int32_t> op_a_r
 %type <Expression> op_mem_ind
-%type <AssertionType> assert_type
+%type <Expression> op_sp_offset
 
-%token EOB "end of buffer"
-%token YYEOF 0 "end of file"
-%start asm_file
+// Data types used only in specific contexts
+%type <AlignmentSpec> align_spec
+%type <AssertionType> assert_type
+%type <Capture> capture_macro
+%type <Capture> capture_rept
+%type <RPNCommand> compound_eq
+%type <std::vector<int32_t>> charmap_args
+%type <std::vector<Expression>> ds_args
+%type <ForArgs> for_args
+%type <std::shared_ptr<MacroArgs>> macro_args
+%type <std::vector<InternedStr>> purge_args
+%type <SectionSpec> sect_attrs
+%type <SectionModifier> sect_mod
+%type <SectionType> sect_type
+%type <StrFmtArgList> strfmt_args
+%type <StrFmtArgList> strfmt_va_args
+%type <bool> maybe_quiet
 
 %%
+
+/******************** Parser rules ********************/
 
 // Assembly files.
 
@@ -322,21 +418,28 @@ asm_file: lines;
 
 lines:
 	  %empty
-	| lines opt_diff_mark line
+	| lines diff_mark line
+	// Continue parsing the next line on a syntax error
+	| error {
+		lexer_SetMode(LEXER_NORMAL);
+		lexer_ToggleStringExpansion(true);
+	} endofline {
+		yyerrok;
+	}
 ;
 
-endofline: NEWLINE | EOB;
-
-opt_diff_mark:
+diff_mark:
 	  %empty // OK
 	| OP_ADD {
 		::error(
-			"syntax error, unexpected + at the beginning of the line (is it a leftover diff mark?)\n"
+		    "syntax error, unexpected '+' at the beginning of the line (is it a leftover diff "
+		    "mark?)"
 		);
 	}
 	| OP_SUB {
 		::error(
-			"syntax error, unexpected - at the beginning of the line (is it a leftover diff mark?)\n"
+		    "syntax error, unexpected '-' at the beginning of the line (is it a leftover diff "
+		    "mark?)"
 		);
 	}
 ;
@@ -346,91 +449,42 @@ opt_diff_mark:
 line:
 	  plain_directive endofline
 	| line_directive // Directives that manage newlines themselves
-	// Continue parsing the next line on a syntax error
-	| error {
-		lexer_SetMode(LEXER_NORMAL);
-		lexer_ToggleStringExpansion(true);
-	} endofline {
-		fstk_StopRept();
-		yyerrok;
-	}
-	// Hint about unindented macros parsed as labels
-	| LABEL error {
-		lexer_SetMode(LEXER_NORMAL);
-		lexer_ToggleStringExpansion(true);
-	} endofline {
-		Symbol *macro = sym_FindExactSymbol($1);
-
-		if (macro && macro->type == SYM_MACRO)
-			fprintf(
-			    stderr,
-			    "    To invoke `%s` as a macro it must be indented\n",
-			    $1.c_str()
-			);
-		fstk_StopRept();
-		yyerrok;
-	}
 ;
+
+endofline: NEWLINE | EOB | EOL;
 
 // For "logistical" reasons, these directives must manage newlines themselves.
 // This is because we need to switch the lexer's mode *after* the newline has been read,
 // and to avoid causing some grammar conflicts (token reducing is finicky).
 // This is DEFINITELY one of the more FRAGILE parts of the codebase, handle with care.
 line_directive:
-	  def_macro
+	  macro_def
 	| rept
 	| for
 	| break
 	| include
 	| if
+	| endc
 	// It's important that all of these require being at line start for `skipIfBlock`
 	| elif
 	| else
 ;
 
 if:
-	POP_IF const NEWLINE {
-		lexer_IncIFDepth();
-
-		if ($2)
-			lexer_RunIFBlock();
-		else
-			lexer_SetMode(LEXER_SKIP_TO_ELIF);
+	POP_IF iconst NEWLINE {
+		act_If($2);
 	}
 ;
 
 elif:
-	POP_ELIF const NEWLINE {
-		if (lexer_GetIFDepth() == 0)
-			fatalerror("Found ELIF outside an IF construct\n");
-
-		if (lexer_RanIFBlock()) {
-			if (lexer_ReachedELSEBlock())
-				fatalerror("Found ELIF after an ELSE block\n");
-
-			lexer_SetMode(LEXER_SKIP_TO_ENDC);
-		} else if ($2) {
-			lexer_RunIFBlock();
-		} else {
-			lexer_SetMode(LEXER_SKIP_TO_ELIF);
-		}
+	POP_ELIF iconst NEWLINE {
+		act_Elif($2);
 	}
 ;
 
 else:
 	POP_ELSE NEWLINE {
-		if (lexer_GetIFDepth() == 0)
-			fatalerror("Found ELSE outside an IF construct\n");
-
-		if (lexer_RanIFBlock()) {
-			if (lexer_ReachedELSEBlock())
-				fatalerror("Found ELSE after an ELSE block\n");
-
-			lexer_SetMode(LEXER_SKIP_TO_ENDC);
-		} else {
-			lexer_RunIFBlock();
-			lexer_ReachELSEBlock();
-		}
+		act_Else();
 	}
 ;
 
@@ -438,88 +492,75 @@ else:
 
 plain_directive:
 	  label
-	| label cpu_commands
-	| label macro
+	| label data
+	| label macro_invocation
 	| label directive
 ;
 
 endc:
-	POP_ENDC {
-		lexer_DecIFDepth();
+	POP_ENDC endofline {
+		act_Endc();
 	}
 ;
 
 def_id:
 	OP_DEF {
 		lexer_ToggleStringExpansion(false);
-	} ID {
+	} SYMBOL {
 		lexer_ToggleStringExpansion(true);
-		$$ = std::move($3);
+		$$ = $3;
 	}
 ;
 
 redef_id:
 	POP_REDEF {
 		lexer_ToggleStringExpansion(false);
-	} ID {
+	} SYMBOL {
 		lexer_ToggleStringExpansion(true);
-		$$ = std::move($3);
+		$$ = $3;
 	}
 ;
 
-// LABEL covers identifiers followed by a double colon (e.g. `call Function::ret`,
-// to be read as `call Function :: ret`). This should not conflict with anything.
-scoped_id:
-	ID {
-		$$ = std::move($1);
-	}
-	| LOCAL_ID {
-		$$ = std::move($1);
-	}
-	| LABEL {
-		$$ = std::move($1);
-	}
-;
+scoped_sym_no_anon: SYMBOL | LABEL | LOCAL;
 
-scoped_anon_id:
-	scoped_id {
-		$$ = std::move($1);
-	}
-	| ANON {
-		$$ = std::move($1);
-	}
-;
+scoped_sym: scoped_sym_no_anon | ANON;
 
 label:
 	  %empty
-	| COLON {
-		sym_AddAnonLabel();
-	}
-	| LOCAL_ID {
-		sym_AddLocalLabel($1);
-	}
-	| LOCAL_ID COLON {
-		sym_AddLocalLabel($1);
-	}
 	| LABEL COLON {
 		sym_AddLabel($1);
-	}
-	| LOCAL_ID DOUBLE_COLON {
-		sym_AddLocalLabel($1);
-		sym_Export($1);
 	}
 	| LABEL DOUBLE_COLON {
 		sym_AddLabel($1);
 		sym_Export($1);
 	}
+	| LOCAL {
+		sym_AddLocalLabel($1);
+	}
+	| LOCAL COLON {
+		sym_AddLocalLabel($1);
+	}
+	| LOCAL DOUBLE_COLON {
+		sym_AddLocalLabel($1);
+		sym_Export($1);
+	}
+	| COLON {
+		sym_AddAnonLabel();
+	}
 ;
 
-macro:
-	ID {
-		// Parsing 'macroargs' will restore the lexer's normal mode
+macro_invocation:
+	SYMBOL {
+		// Parsing 'macro_args' will restore the lexer's normal mode
 		lexer_SetMode(LEXER_RAW);
 	} macro_args {
-		fstk_RunMacro($1, $3);
+		fstk_RunMacro($1, $3, false);
+	}
+	| QMACRO {
+		// Parsing 'macro_args' will restore the lexer's normal mode
+		lexer_SetMode(LEXER_RAW);
+	} macro_args {
+		fstk_RunMacro($1, $3, true);
 	}
 ;
 
@@ -534,15 +575,10 @@ macro_args:
 ;
 
 directive:
-	  endc
-	| print
+	  print
 	| println
 	| export
 	| export_def
-	| db
-	| dw
-	| dl
-	| ds
 	| section
 	| rsreset
 	| rsset
@@ -620,36 +656,17 @@ compound_eq:
 ;
 
 align:
-	OP_ALIGN align_spec {
+	POP_ALIGN align_spec {
 		sect_AlignPC($2.alignment, $2.alignOfs);
 	}
 ;
 
 align_spec:
 	uconst {
-		if ($1 > 16) {
-			::error("Alignment must be between 0 and 16, not %u\n", $1);
-			$$.alignment = $$.alignOfs = 0;
-		} else {
-			$$.alignment = $1;
-			$$.alignOfs = 0;
-		}
+		$$ = act_Alignment($1, 0);
 	}
-	| uconst COMMA const {
-		if ($1 > 16) {
-			::error("Alignment must be between 0 and 16, not %u\n", $1);
-			$$.alignment = $$.alignOfs = 0;
-		} else if ($3 <= -(1 << $1) || $3 >= 1 << $1) {
-			::error(
-				"The absolute alignment offset (%" PRIu32 ") must be less than alignment size (%d)\n",
-				(uint32_t)($3 < 0 ? -$3 : $3),
-				1 << $1
-			);
-			$$.alignment = $$.alignOfs = 0;
-		} else {
-			$$.alignment = $1;
-			$$.alignOfs = $3 < 0 ? (1 << $1) + $3 : $3;
-		}
+	| uconst COMMA iconst {
+		$$ = act_Alignment($1, $3);
 	}
 ;
 
@@ -680,12 +697,12 @@ popo:
 pusho:
 	POP_PUSHO {
 		opt_Push();
-		// Parsing 'optional_opt_list' will restore the lexer's normal mode
+		// Parsing 'pusho_opt_list' will restore the lexer's normal mode
 		lexer_SetMode(LEXER_RAW);
-	} optional_opt_list
+	} pusho_opt_list
 ;
 
-optional_opt_list:
+pusho_opt_list:
 	%empty {
 		lexer_SetMode(LEXER_NORMAL);
 	}
@@ -712,13 +729,13 @@ endsection:
 
 fail:
 	POP_FAIL string {
-		fatalerror("%s\n", $2.c_str());
+		fatal("%s", $2.c_str());
 	}
 ;
 
 warn:
 	POP_WARN string {
-		warning(WARNING_USER, "%s\n", $2.c_str());
+		warning(WARNING_USER, "%s", $2.c_str());
 	}
 ;
 
@@ -739,26 +756,16 @@ assert_type:
 
 assert:
 	POP_ASSERT assert_type relocexpr {
-		if (!$3.isKnown()) {
-			out_CreateAssert($2, $3, "", sect_GetOutputOffset());
-		} else if ($3.value() == 0) {
-			failAssert($2);
-		}
+		act_Assert($2, $3, "");
 	}
 	| POP_ASSERT assert_type relocexpr COMMA string {
-		if (!$3.isKnown()) {
-			out_CreateAssert($2, $3, $5, sect_GetOutputOffset());
-		} else if ($3.value() == 0) {
-			failAssertMsg($2, $5);
-		}
+		act_Assert($2, $3, $5);
 	}
-	| POP_STATIC_ASSERT assert_type const {
-		if ($3 == 0)
-			failAssert($2);
+	| POP_STATIC_ASSERT assert_type iconst {
+		act_StaticAssert($2, $3, "");
 	}
-	| POP_STATIC_ASSERT assert_type const COMMA string {
-		if ($3 == 0)
-			failAssertMsg($2, $5);
+	| POP_STATIC_ASSERT assert_type iconst COMMA string {
+		act_StaticAssert($2, $3, $5);
 	}
 ;
 
@@ -767,7 +774,7 @@ shift:
 		if (MacroArgs *macroArgs = fstk_GetCurrentMacroArgs(); macroArgs) {
 			macroArgs->shiftArgs($2);
 		} else {
-			::error("Cannot shift macro arguments outside of a macro\n");
+			::error("Cannot shift macro arguments outside of a macro");
 		}
 	}
 ;
@@ -776,33 +783,44 @@ shift_const:
 	%empty {
 		$$ = 1;
 	}
-	| const
+	| iconst
 ;
 
 load:
 	POP_LOAD sect_mod string COMMA sect_type sect_org sect_attrs {
-		sect_SetLoadSection($3, (SectionType)$5, $6, $7, $2);
+		sect_SetLoadSection($3, $5, $6, $7, $2);
 	}
 	| POP_ENDL {
-		sect_EndLoadSection();
+		sect_EndLoadSection(nullptr);
+	}
+;
+
+maybe_quiet:
+	%empty {
+		$$ = false;
+	}
+	| QUESTIONMARK {
+		$$ = true;
 	}
 ;
 
 rept:
-	POP_REPT uconst NEWLINE capture_rept endofline {
-		if ($4.span.ptr)
-			fstk_RunRept($2, $4.lineNo, $4.span);
+	POP_REPT maybe_quiet uconst NEWLINE capture_rept endofline {
+		if ($5.span.ptr) {
+			fstk_RunRept($3, $5.lineNo, $5.span, $2);
+		}
 	}
 ;
 
 for:
 	POP_FOR {
 		lexer_ToggleStringExpansion(false);
-	} ID {
+	} maybe_quiet SYMBOL {
 		lexer_ToggleStringExpansion(true);
 	} COMMA for_args NEWLINE capture_rept endofline {
-		if ($8.span.ptr)
-			fstk_RunFor($3, $6.start, $6.stop, $6.step, $8.lineNo, $8.span);
+		if ($9.span.ptr) {
+			fstk_RunFor($4, $7.start, $7.stop, $7.step, $9.lineNo, $9.span, $3);
+		}
 	}
 ;
 
@@ -813,17 +831,17 @@ capture_rept:
 ;
 
 for_args:
-	const {
+	iconst {
 		$$.start = 0;
 		$$.stop = $1;
 		$$.step = 1;
 	}
-	| const COMMA const {
+	| iconst COMMA iconst {
 		$$.start = $1;
 		$$.stop = $3;
 		$$.step = 1;
 	}
-	| const COMMA const COMMA const {
+	| iconst COMMA iconst COMMA iconst {
 		$$.start = $1;
 		$$.stop = $3;
 		$$.step = $5;
@@ -832,19 +850,21 @@ for_args:
 
 break:
 	label POP_BREAK endofline {
-		if (fstk_Break())
+		if (fstk_Break()) {
 			lexer_SetMode(LEXER_SKIP_TO_ENDR);
+		}
 	}
 ;
 
-def_macro:
+macro_def:
 	POP_MACRO {
 		lexer_ToggleStringExpansion(false);
-	} ID {
+	} maybe_quiet SYMBOL {
 		lexer_ToggleStringExpansion(true);
 	} NEWLINE capture_macro endofline {
-		if ($6.span.ptr)
-			sym_AddMacro($3, $6.lineNo, $6.span);
+		if ($7.span.ptr) {
+			sym_AddMacro($4, $7.lineNo, $7.span, $3);
+		}
 	}
 ;
 
@@ -891,94 +911,42 @@ endu:
 	}
 ;
 
-ds:
-	POP_DS uconst {
-		sect_Skip($2, true);
-	}
-	| POP_DS uconst COMMA ds_args trailing_comma {
-		sect_RelBytes($2, $4);
-	}
-	| POP_DS OP_ALIGN LBRACK align_spec RBRACK trailing_comma {
-		uint32_t n = sect_GetAlignBytes($4.alignment, $4.alignOfs);
-
-		sect_Skip(n, true);
-		sect_AlignPC($4.alignment, $4.alignOfs);
-	}
-	| POP_DS OP_ALIGN LBRACK align_spec RBRACK COMMA ds_args trailing_comma {
-		uint32_t n = sect_GetAlignBytes($4.alignment, $4.alignOfs);
-
-		sect_RelBytes(n, $7);
-		sect_AlignPC($4.alignment, $4.alignOfs);
-	}
-;
-
-ds_args:
-	reloc_8bit {
-		$$.push_back(std::move($1));
-	}
-	| ds_args COMMA reloc_8bit {
-		$$ = std::move($1);
-		$$.push_back(std::move($3));
-	}
-;
-
-db:
-	POP_DB {
-		sect_Skip(1, false);
-	}
-	| POP_DB constlist_8bit trailing_comma
-;
-
-dw:
-	POP_DW {
-		sect_Skip(2, false);
-	}
-	| POP_DW constlist_16bit trailing_comma
-;
-
-dl:
-	POP_DL {
-		sect_Skip(4, false);
-	}
-	| POP_DL constlist_32bit trailing_comma
-;
-
 def_equ:
-	def_id POP_EQU const {
-		$$ = std::move($1);
+	def_id POP_EQU iconst {
+		$$ = $1;
 		sym_AddEqu($$, $3);
 	}
 ;
 
 redef_equ:
-	redef_id POP_EQU const {
-		$$ = std::move($1);
+	redef_id POP_EQU iconst {
+		$$ = $1;
 		sym_RedefEqu($$, $3);
 	}
 ;
 
 def_set:
-	def_id POP_EQUAL const {
-		$$ = std::move($1);
+	def_id POP_EQUAL iconst {
+		$$ = $1;
 		sym_AddVar($$, $3);
 	}
-	| redef_id POP_EQUAL const {
-		$$ = std::move($1);
+	| redef_id POP_EQUAL iconst {
+		$$ = $1;
 		sym_AddVar($$, $3);
 	}
-	| def_id compound_eq const {
-		$$ = std::move($1);
-		compoundAssignment($$, $2, $3);
+	| def_id compound_eq iconst {
+		$$ = $1;
+		act_CompoundAssignment($$, $2, $3);
 	}
-	| redef_id compound_eq const {
-		$$ = std::move($1);
-		compoundAssignment($$, $2, $3);
+	| redef_id compound_eq iconst {
+		$$ = $1;
+		act_CompoundAssignment($$, $2, $3);
 	}
 ;
 
 def_rb:
 	def_id POP_RB rs_uconst {
-		$$ = std::move($1);
+		$$ = $1;
 		uint32_t rs = sym_GetRSValue();
 		sym_AddEqu($$, rs);
 		sym_SetRSValue(rs + $3);
@@ -987,7 +955,7 @@ def_rb:
 
 def_rw:
 	def_id POP_RW rs_uconst {
-		$$ = std::move($1);
+		$$ = $1;
 		uint32_t rs = sym_GetRSValue();
 		sym_AddEqu($$, rs);
 		sym_SetRSValue(rs + 2 * $3);
@@ -995,8 +963,8 @@ def_rw:
 ;
 
 def_rl:
-	def_id Z80_RL rs_uconst {
-		$$ = std::move($1);
+	def_id SM83_RL rs_uconst {
+		$$ = $1;
 		uint32_t rs = sym_GetRSValue();
 		sym_AddEqu($$, rs);
 		sym_SetRSValue(rs + 4 * $3);
@@ -1005,14 +973,14 @@ def_rl:
 
 def_equs:
 	def_id POP_EQUS string {
-		$$ = std::move($1);
+		$$ = $1;
 		sym_AddString($$, std::make_shared<std::string>($3));
 	}
 ;
 
 redef_equs:
 	redef_id POP_EQUS string {
-		$$ = std::move($1);
+		$$ = $1;
 		sym_RedefString($$, std::make_shared<std::string>($3));
 	}
 ;
@@ -1021,17 +989,18 @@ purge:
 	POP_PURGE {
 		lexer_ToggleStringExpansion(false);
 	} purge_args trailing_comma {
-		for (std::string &arg : $3)
+		for (InternedStr arg : $3) {
 			sym_Purge(arg);
+		}
 		lexer_ToggleStringExpansion(true);
 	}
 ;
 
 purge_args:
-	scoped_id {
+	scoped_sym_no_anon {
 		$$.push_back($1);
 	}
-	| purge_args COMMA scoped_id {
+	| purge_args COMMA scoped_sym_no_anon {
 		$$ = std::move($1);
 		$$.push_back($3);
 	}
@@ -1045,7 +1014,7 @@ export_list:
 ;
 
 export_list_entry:
-	scoped_id {
+	scoped_sym_no_anon {
 		sym_Export($1);
 	}
 ;
@@ -1057,48 +1026,61 @@ export_def:
 ;
 
 include:
-	label POP_INCLUDE string endofline {
-		fstk_RunInclude($3, false);
-		if (failedOnMissingInclude)
+	label POP_INCLUDE maybe_quiet string endofline {
+		if (fstk_RunInclude($4, $3)) {
 			YYACCEPT;
+		}
 	}
 ;
 
 incbin:
 	POP_INCBIN string {
-		sect_BinaryFile($2, 0);
-		if (failedOnMissingInclude)
+		if (sect_BinaryFile($2, 0)) {
 			YYACCEPT;
+		}
 	}
-	| POP_INCBIN string COMMA const {
-		sect_BinaryFile($2, $4);
-		if (failedOnMissingInclude)
+	| POP_INCBIN string COMMA uconst {
+		if (sect_BinaryFile($2, $4)) {
 			YYACCEPT;
+		}
 	}
-	| POP_INCBIN string COMMA const COMMA const {
-		sect_BinaryFileSlice($2, $4, $6);
-		if (failedOnMissingInclude)
+	| POP_INCBIN string COMMA uconst COMMA uconst {
+		if (sect_BinaryFileSlice($2, $4, $6)) {
 			YYACCEPT;
+		}
 	}
 ;
 
 charmap:
-	POP_CHARMAP string COMMA const_8bit {
-		charmap_Add($2, (uint8_t)$4);
+	POP_CHARMAP string COMMA charmap_args trailing_comma {
+		charmap_Add($2, std::move($4));
+	}
+	| POP_CHARMAP CHARACTER COMMA charmap_args trailing_comma {
+		charmap_Add($2, std::move($4));
+	}
+;
+
+charmap_args:
+	iconst {
+		$$.push_back(std::move($1));
+	}
+	| charmap_args COMMA iconst {
+		$$ = std::move($1);
+		$$.push_back(std::move($3));
 	}
 ;
 
 newcharmap:
-	POP_NEWCHARMAP ID {
+	POP_NEWCHARMAP SYMBOL {
 		charmap_New($2, nullptr);
 	}
-	| POP_NEWCHARMAP ID COMMA ID {
+	| POP_NEWCHARMAP SYMBOL COMMA SYMBOL {
 		charmap_New($2, &$4);
 	}
 ;
 
 setcharmap:
-	POP_SETCHARMAP ID {
+	POP_SETCHARMAP SYMBOL {
 		charmap_Set($2);
 	}
 ;
@@ -1110,7 +1092,7 @@ pushc:
 ;
 
 pushc_setcharmap:
-	POP_PUSHC ID {
+	POP_PUSHC SYMBOL {
 		charmap_Push();
 		charmap_Set($2);
 	}
@@ -1141,22 +1123,26 @@ print_exprs:
 ;
 
 print_expr:
-	const_no_str {
-		printf("$%" PRIX32, $1);
+	relocexpr_no_str {
+		printf("$%" PRIX32, $1.getConstVal());
 	}
-	| string {
+	| string_literal {
 		// Allow printing NUL characters
 		fwrite($1.data(), 1, $1.length(), stdout);
 	}
+	| scoped_sym {
+		handleSymbolByType(
+		    $1,
+		    [](Expression const &expr) { printf("$%" PRIX32, expr.getConstVal()); },
+		    [](std::string const &str) { fwrite(str.data(), 1, str.length(), stdout); }
+		);
+	}
 ;
 
-bit_const:
-	const {
-		$$ = $1;
-		if ($$ < 0 || $$ > 7) {
-			::error("Bit number must be between 0 and 7, not %" PRId32 "\n", $$);
-			$$ = 0;
-		}
+reloc_3bit:
+	relocexpr {
+		$$ = std::move($1);
+		$$.checkNBit(3);
 	}
 ;
 
@@ -1166,12 +1152,26 @@ constlist_8bit:
 ;
 
 constlist_8bit_entry:
-	reloc_8bit_no_str {
+	relocexpr_no_str {
+		$1.checkNBit(8);
 		sect_RelByte($1, 0);
 	}
-	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
-		sect_AbsByteString(output);
+	| string_literal {
+		std::vector<int32_t> output = charmap_Convert($1);
+		sect_ByteString(output);
+	}
+	| scoped_sym {
+		handleSymbolByType(
+		    $1,
+		    [](Expression const &expr) {
+			    expr.checkNBit(8);
+			    sect_RelByte(expr, 0);
+		    },
+		    [](std::string const &str) {
+			    std::vector<int32_t> output = charmap_Convert(str);
+			    sect_ByteString(output);
+		    }
+		);
 	}
 ;
 
@@ -1181,12 +1181,32 @@ constlist_16bit:
 ;
 
 constlist_16bit_entry:
-	reloc_16bit_no_str {
+	relocexpr_no_str {
+		$1.checkNBit(16);
 		sect_RelWord($1, 0);
 	}
-	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
-		sect_AbsWordString(output);
+	| string_literal {
+		std::vector<int32_t> output = charmap_Convert($1);
+		sect_WordString(output);
+	}
+	| scoped_sym {
+		handleSymbolByType(
+		    $1,
+		    [](Expression const &expr) {
+			    expr.checkNBit(16);
+			    sect_RelWord(expr, 0);
+		    },
+		    [](std::string const &str) {
+			    std::vector<int32_t> output = charmap_Convert(str);
+			    sect_WordString(output);
+		    }
+		);
+	}
+	| fragment_literal {
+		Expression expr;
+		expr.makeSymbol($1);
+		expr.checkNBit(16);
+		sect_RelWord(expr, 0);
 	}
 ;
 
@@ -1199,9 +1219,19 @@ constlist_32bit_entry:
 	relocexpr_no_str {
 		sect_RelLong($1, 0);
 	}
-	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
-		sect_AbsLongString(output);
+	| string_literal {
+		std::vector<int32_t> output = charmap_Convert($1);
+		sect_LongString(output);
+	}
+	| scoped_sym {
+		handleSymbolByType(
+		    $1,
+		    [](Expression const &expr) { sect_RelLong(expr, 0); },
+		    [](std::string const &str) {
+			    std::vector<int32_t> output = charmap_Convert(str);
+			    sect_LongString(output);
+		    }
+		);
 	}
 ;
 
@@ -1212,22 +1242,10 @@ reloc_8bit:
 	}
 ;
 
-reloc_8bit_no_str:
-	relocexpr_no_str {
+reloc_8bit_signed:
+	relocexpr {
 		$$ = std::move($1);
-		$$.checkNBit(8);
-	}
-;
-
-reloc_8bit_offset:
-	OP_ADD relocexpr {
-		$$ = std::move($2);
-		$$.checkNBit(8);
-	}
-	| OP_SUB relocexpr {
-		$$ = std::move($2);
-		$$.makeNeg();
-		$$.checkNBit(8);
+		$$.checkSignedNBit(8);
 	}
 ;
 
@@ -1236,12 +1254,22 @@ reloc_16bit:
 		$$ = std::move($1);
 		$$.checkNBit(16);
 	}
+	| fragment_literal {
+		$$.makeSymbol($1);
+	}
 ;
 
-reloc_16bit_no_str:
-	relocexpr_no_str {
-		$$ = std::move($1);
-		$$.checkNBit(16);
+fragment_literal:
+	LBRACKS fragment_literal_name asm_file RBRACKS {
+		sect_PopSection();
+		$$ = $2;
+	}
+;
+
+fragment_literal_name:
+	%empty {
+		$$ = sect_PushSectionFragmentLiteral();
+		sym_AddLabel($$);
 	}
 ;
 
@@ -1249,22 +1277,37 @@ relocexpr:
 	relocexpr_no_str {
 		$$ = std::move($1);
 	}
-	| string {
-		std::vector<uint8_t> output = charmap_Convert($1);
-		$$.makeNumber(str2int2(output));
+	| string_literal {
+		$$.makeNumber(act_StringToNum($1));
+	}
+	| scoped_sym {
+		$$ = handleSymbolByType(
+		    $1,
+		    [](Expression const &expr) { return expr; },
+		    [](std::string const &str) {
+			    Expression expr;
+			    expr.makeNumber(act_StringToNum(str));
+			    return expr;
+		    }
+		);
 	}
 ;
 
 relocexpr_no_str:
-	scoped_anon_id {
-		$$.makeSymbol($1);
-	}
-	| NUMBER {
+	NUMBER {
 		$$.makeNumber($1);
 	}
+	| CHARACTER {
+		$$.makeNumber(act_CharToNum($1));
+	}
+	| string OP_STREQU string {
+		$$.makeNumber($1.compare($3) == 0);
+	}
+	| string OP_STRNE string {
+		$$.makeNumber($1.compare($3) != 0);
+	}
 	| OP_LOGICNOT relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeLogicNot();
+		$$.makeUnaryOp(RPN_LOGNOT, std::move($2));
 	}
 	| relocexpr OP_LOGICOR relocexpr {
 		$$.makeBinaryOp(RPN_LOGOR, std::move($1), $3);
@@ -1330,29 +1373,31 @@ relocexpr_no_str:
 		$$ = std::move($2);
 	}
 	| OP_SUB relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeNeg();
+		$$.makeUnaryOp(RPN_NEG, std::move($2));
 	}
 	| OP_NOT relocexpr %prec NEG {
-		$$ = std::move($2);
-		$$.makeNot();
+		$$.makeUnaryOp(RPN_NOT, std::move($2));
 	}
 	| OP_HIGH LPAREN relocexpr RPAREN {
-		$$ = std::move($3);
-		$$.makeHigh();
+		$$.makeUnaryOp(RPN_HIGH, std::move($3));
 	}
 	| OP_LOW LPAREN relocexpr RPAREN {
-		$$ = std::move($3);
-		$$.makeLow();
+		$$.makeUnaryOp(RPN_LOW, std::move($3));
+	}
+	| OP_BITWIDTH LPAREN relocexpr RPAREN {
+		$$.makeUnaryOp(RPN_BITWIDTH, std::move($3));
+	}
+	| OP_TZCOUNT LPAREN relocexpr RPAREN {
+		$$.makeUnaryOp(RPN_TZCOUNT, std::move($3));
 	}
 	| OP_ISCONST LPAREN relocexpr RPAREN {
 		$$.makeNumber($3.isKnown());
 	}
-	| OP_BANK LPAREN scoped_anon_id RPAREN {
-		// '@' is also an ID; it is handled here
+	| OP_BANK LPAREN scoped_sym RPAREN {
+		// '@' is also a SYMBOL; it is handled here
 		$$.makeBankSymbol($3);
 	}
-	| OP_BANK LPAREN string RPAREN {
+	| OP_BANK LPAREN string_literal RPAREN {
 		$$.makeBankSection($3);
 	}
 	| OP_SIZEOF LPAREN string RPAREN {
@@ -1362,83 +1407,119 @@ relocexpr_no_str:
 		$$.makeStartOfSection($3);
 	}
 	| OP_SIZEOF LPAREN sect_type RPAREN {
-		$$.makeSizeOfSectionType((SectionType)$3);
+		$$.makeSizeOfSectionType($3);
 	}
 	| OP_STARTOF LPAREN sect_type RPAREN {
-		$$.makeStartOfSectionType((SectionType)$3);
+		$$.makeStartOfSectionType($3);
+	}
+	| OP_SIZEOF LPAREN MODE_R8 RPAREN {
+		$$.makeNumber(1);
+	}
+	| OP_SIZEOF LPAREN MODE_R16 RPAREN {
+		$$.makeNumber(2);
 	}
 	| OP_DEF {
 		lexer_ToggleStringExpansion(false);
-	} LPAREN scoped_anon_id RPAREN {
+	} LPAREN scoped_sym RPAREN {
 		$$.makeNumber(sym_FindScopedValidSymbol($4) != nullptr);
 		lexer_ToggleStringExpansion(true);
 	}
-	| OP_ROUND LPAREN const opt_q_arg RPAREN {
+	| OP_ROUND LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Round($3, $4));
 	}
-	| OP_CEIL LPAREN const opt_q_arg RPAREN {
+	| OP_CEIL LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Ceil($3, $4));
 	}
-	| OP_FLOOR LPAREN const opt_q_arg RPAREN {
+	| OP_FLOOR LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Floor($3, $4));
 	}
-	| OP_FDIV LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_FDIV LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Div($3, $5, $6));
 	}
-	| OP_FMUL LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_FMUL LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Mul($3, $5, $6));
 	}
-	| OP_FMOD LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_FMOD LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Mod($3, $5, $6));
 	}
-	| OP_POW LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_POW LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Pow($3, $5, $6));
 	}
-	| OP_LOG LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_LOG LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Log($3, $5, $6));
 	}
-	| OP_SIN LPAREN const opt_q_arg RPAREN {
+	| OP_SIN LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Sin($3, $4));
 	}
-	| OP_COS LPAREN const opt_q_arg RPAREN {
+	| OP_COS LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Cos($3, $4));
 	}
-	| OP_TAN LPAREN const opt_q_arg RPAREN {
+	| OP_TAN LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_Tan($3, $4));
 	}
-	| OP_ASIN LPAREN const opt_q_arg RPAREN {
+	| OP_ASIN LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_ASin($3, $4));
 	}
-	| OP_ACOS LPAREN const opt_q_arg RPAREN {
+	| OP_ACOS LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_ACos($3, $4));
 	}
-	| OP_ATAN LPAREN const opt_q_arg RPAREN {
+	| OP_ATAN LPAREN iconst precision_arg RPAREN {
 		$$.makeNumber(fix_ATan($3, $4));
 	}
-	| OP_ATAN2 LPAREN const COMMA const opt_q_arg RPAREN {
+	| OP_ATAN2 LPAREN iconst COMMA iconst precision_arg RPAREN {
 		$$.makeNumber(fix_ATan2($3, $5, $6));
 	}
 	| OP_STRCMP LPAREN string COMMA string RPAREN {
 		$$.makeNumber($3.compare($5));
 	}
+	| OP_STRFIND LPAREN string COMMA string RPAREN {
+		size_t pos = $3.find($5);
+		$$.makeNumber(pos != std::string::npos ? pos : -1);
+	}
+	| OP_STRRFIND LPAREN string COMMA string RPAREN {
+		size_t pos = $3.rfind($5);
+		$$.makeNumber(pos != std::string::npos ? pos : -1);
+	}
 	| OP_STRIN LPAREN string COMMA string RPAREN {
-		auto pos = $3.find($5);
-
+		warning(WARNING_OBSOLETE, "`STRIN` is deprecated; use 0-indexed `STRFIND` instead");
+		size_t pos = $3.find($5);
 		$$.makeNumber(pos != std::string::npos ? pos + 1 : 0);
 	}
 	| OP_STRRIN LPAREN string COMMA string RPAREN {
-		auto pos = $3.rfind($5);
-
+		warning(WARNING_OBSOLETE, "`STRRIN` is deprecated; use 0-indexed `STRRFIND` instead");
+		size_t pos = $3.rfind($5);
 		$$.makeNumber(pos != std::string::npos ? pos + 1 : 0);
 	}
 	| OP_STRLEN LPAREN string RPAREN {
-		$$.makeNumber(strlenUTF8($3));
+		$$.makeNumber(act_StringLen($3, true));
+	}
+	| OP_BYTELEN LPAREN string RPAREN {
+		$$.makeNumber($3.length());
 	}
 	| OP_CHARLEN LPAREN string RPAREN {
-		$$.makeNumber(charlenUTF8($3));
+		$$.makeNumber(act_CharLen($3));
 	}
 	| OP_INCHARMAP LPAREN string RPAREN {
 		$$.makeNumber(charmap_HasChar($3));
+	}
+	| OP_CHARCMP LPAREN string COMMA string RPAREN {
+		$$.makeNumber(act_CharCmp($3, $5));
+	}
+	| OP_CHARSIZE LPAREN string RPAREN {
+		size_t charSize = charmap_CharSize($3);
+		if (charSize == 0) {
+			::error("CHARSIZE: No character mapping for \"%s\"", $3.c_str());
+		}
+		$$.makeNumber(charSize);
+	}
+	| OP_CHARVAL LPAREN string COMMA iconst RPAREN {
+		$$.makeNumber(act_CharVal($3, $5));
+	}
+	| OP_CHARVAL LPAREN string RPAREN {
+		$$.makeNumber(act_CharVal($3));
+	}
+	| OP_STRBYTE LPAREN string COMMA iconst RPAREN {
+		$$.makeNumber(act_StringByte($3, $5));
 	}
 	| LPAREN relocexpr RPAREN {
 		$$ = std::move($2);
@@ -1446,65 +1527,81 @@ relocexpr_no_str:
 ;
 
 uconst:
-	const {
+	iconst {
 		$$ = $1;
-		if ($$ < 0)
-			fatalerror("Constant must not be negative: %d\n", $$);
+		if ($$ < 0) {
+			fatal("Constant must not be negative: %d", $$);
+		}
 	}
 ;
 
-const:
+iconst:
 	relocexpr {
 		$$ = $1.getConstVal();
 	}
 ;
 
-const_no_str:
-	relocexpr_no_str {
-		$$ = $1.getConstVal();
-	}
-;
-
-const_8bit:
-	reloc_8bit {
-		$$ = $1.getConstVal();
-	}
-;
-
-opt_q_arg:
+precision_arg:
 	%empty {
-		$$ = fix_Precision();
+		$$ = options.fixPrecision;
 	}
-	| COMMA const {
+	| COMMA iconst {
 		$$ = $2;
 		if ($$ < 1 || $$ > 31) {
-			::error("Fixed-point precision must be between 1 and 31, not %" PRId32 "\n", $$);
-			$$ = fix_Precision();
+			::error("Fixed-point precision must be between 1 and 31, not %" PRId32, $$);
+			$$ = options.fixPrecision;
 		}
 	}
 ;
 
-string:
+string_literal:
 	STRING {
 		$$ = std::move($1);
 	}
-	| OP_STRSUB LPAREN string COMMA const COMMA uconst RPAREN {
-		size_t len = strlenUTF8($3);
-		uint32_t pos = adjustNegativePos($5, len, "STRSUB");
-
-		$$ = strsubUTF8($3, pos, $7);
+	| string OP_CAT string {
+		$$ = std::move($1);
+		$$.append($3);
 	}
-	| OP_STRSUB LPAREN string COMMA const RPAREN {
-		size_t len = strlenUTF8($3);
-		uint32_t pos = adjustNegativePos($5, len, "STRSUB");
-
-		$$ = strsubUTF8($3, pos, pos > len ? 0 : len + 1 - pos);
+	| OP_READFILE LPAREN string RPAREN {
+		if (std::optional<std::string> contents = act_ReadFile($3, UINT32_MAX); contents) {
+			$$ = std::move(*contents);
+		} else {
+			YYACCEPT;
+		}
 	}
-	| OP_CHARSUB LPAREN string COMMA const RPAREN {
-		size_t len = charlenUTF8($3);
-		uint32_t pos = adjustNegativePos($5, len, "CHARSUB");
-
-		$$ = charsubUTF8($3, pos);
+	| OP_READFILE LPAREN string COMMA uconst RPAREN {
+		if (std::optional<std::string> contents = act_ReadFile($3, $5); contents) {
+			$$ = std::move(*contents);
+		} else {
+			YYACCEPT;
+		}
+	}
+	| OP_STRSLICE LPAREN string COMMA iconst COMMA iconst RPAREN {
+		$$ = act_StringSlice($3, $5, $7);
+	}
+	| OP_STRSLICE LPAREN string COMMA iconst RPAREN {
+		$$ = act_StringSlice($3, $5, std::nullopt);
+	}
+	| OP_STRSUB LPAREN string COMMA iconst COMMA uconst RPAREN {
+		$$ = act_StringSub($3, $5, $7);
+	}
+	| OP_STRSUB LPAREN string COMMA iconst RPAREN {
+		$$ = act_StringSub($3, $5, std::nullopt);
+	}
+	| OP_STRCHAR LPAREN string COMMA iconst RPAREN {
+		$$ = act_StringChar($3, $5);
+	}
+	| OP_CHARSUB LPAREN string COMMA iconst RPAREN {
+		$$ = act_CharSub($3, $5);
+	}
+	| OP_REVCHAR LPAREN charmap_args RPAREN {
+		bool unique;
+		$$ = charmap_Reverse($3, unique);
+		if (!unique) {
+			::error("REVCHAR: Multiple character mappings to values");
+		} else if ($$.empty()) {
+			::error("REVCHAR: No character mapping to values");
+		}
 	}
 	| OP_STRCAT LPAREN RPAREN {
 		$$.clear();
@@ -1514,30 +1611,33 @@ string:
 	}
 	| OP_STRUPR LPAREN string RPAREN {
 		$$ = std::move($3);
-		std::transform(RANGE($$), $$.begin(), [](char c) { return toupper(c); });
+		std::transform(RANGE($$), $$.begin(), toUpper);
 	}
 	| OP_STRLWR LPAREN string RPAREN {
 		$$ = std::move($3);
-		std::transform(RANGE($$), $$.begin(), [](char c) { return tolower(c); });
+		std::transform(RANGE($$), $$.begin(), toLower);
 	}
 	| OP_STRRPL LPAREN string COMMA string COMMA string RPAREN {
-		$$ = strrpl($3, $5, $7);
+		$$ = act_StringReplace($3, $5, $7);
 	}
 	| OP_STRFMT LPAREN strfmt_args RPAREN {
-		$$ = strfmt($3.format, $3.args);
+		$$ = act_StringFormat($3.format, $3.args);
 	}
-	| POP_SECTION LPAREN scoped_anon_id RPAREN {
-		Symbol *sym = sym_FindScopedValidSymbol($3);
+	| POP_SECTION LPAREN scoped_sym RPAREN {
+		$$ = act_SectionName($3);
+	}
+;
 
-		if (!sym)
-			fatalerror("Unknown symbol \"%s\"\n", $3.c_str());
-		Section const *section = sym->getSection();
-
-		if (!section)
-			fatalerror("\"%s\" does not belong to any section\n", sym->name.c_str());
-		// Section names are capped by rgbasm's maximum string length,
-		// so this currently can't overflow.
-		$$ = section->name;
+string:
+	string_literal {
+		$$ = std::move($1);
+	}
+	| scoped_sym {
+		if (Symbol *sym = sym_FindScopedSymbol($1); sym && sym->type == SYM_EQUS) {
+			$$ = *sym->getEqus();
+		} else {
+			::error("`%s` is not a string symbol", $1.c_str());
+		}
 	}
 ;
 
@@ -1561,26 +1661,36 @@ strfmt_args:
 
 strfmt_va_args:
 	  %empty {}
-	| strfmt_va_args COMMA const_no_str {
+	| strfmt_va_args COMMA relocexpr_no_str {
 		$$ = std::move($1);
-		$$.args.push_back((uint32_t)$3);
+		$$.args.push_back(static_cast<uint32_t>($3.getConstVal()));
 	}
-	| strfmt_va_args COMMA string {
+	| strfmt_va_args COMMA string_literal {
 		$$ = std::move($1);
 		$$.args.push_back(std::move($3));
+	}
+	| strfmt_va_args COMMA scoped_sym {
+		$$ = std::move($1);
+		handleSymbolByType(
+		    $3,
+		    [&](Expression const &expr) {
+			    $$.args.push_back(static_cast<uint32_t>(expr.getConstVal()));
+		    },
+		    [&](std::string const &str) { $$.args.push_back(str); }
+		);
 	}
 ;
 
 section:
 	POP_SECTION sect_mod string COMMA sect_type sect_org sect_attrs {
-		sect_NewSection($3, (SectionType)$5, $6, $7, $2);
+		sect_NewSection($3, $5, $6, $7, $2);
 	}
 ;
 
 pushs_section:
 	POP_PUSHS sect_mod string COMMA sect_type sect_org sect_attrs {
 		sect_PushSection();
-		sect_NewSection($3, (SectionType)$5, $6, $7, $2);
+		sect_NewSection($3, $5, $6, $7, $2);
 	}
 ;
 
@@ -1629,8 +1739,8 @@ sect_org:
 	}
 	| LBRACK uconst RBRACK {
 		$$ = $2;
-		if ($$ < 0 || $$ >= 0x10000) {
-			::error("Address $%x is not 16-bit\n", $$);
+		if ($$ < 0 || $$ > 0xFFFF) {
+			::error("Address $%x is not 16-bit", $$);
 			$$ = -1;
 		}
 	}
@@ -1642,7 +1752,7 @@ sect_attrs:
 		$$.alignOfs = 0;
 		$$.bank = -1;
 	}
-	| sect_attrs COMMA OP_ALIGN LBRACK align_spec RBRACK {
+	| sect_attrs COMMA POP_ALIGN LBRACK align_spec RBRACK {
 		$$ = $1;
 		$$.alignment = $5.alignment;
 		$$.alignOfs = $5.alignOfs;
@@ -1653,546 +1763,655 @@ sect_attrs:
 	}
 ;
 
-// CPU commands.
+// CPU instructions and data declarations
 
-cpu_commands:
-	  cpu_command
-	| cpu_command DOUBLE_COLON cpu_commands
+data:
+	  datum
+	| datum DOUBLE_COLON data
 ;
 
-cpu_command:
-	  z80_adc
-	| z80_add
-	| z80_and
-	| z80_bit
-	| z80_call
-	| z80_ccf
-	| z80_cp
-	| z80_cpl
-	| z80_daa
-	| z80_dec
-	| z80_di
-	| z80_ei
-	| z80_halt
-	| z80_inc
-	| z80_jp
-	| z80_jr
-	| z80_ld
-	| z80_ldd
-	| z80_ldi
-	| z80_ldio
-	| z80_nop
-	| z80_or
-	| z80_pop
-	| z80_push
-	| z80_res
-	| z80_ret
-	| z80_reti
-	| z80_rl
-	| z80_rla
-	| z80_rlc
-	| z80_rlca
-	| z80_rr
-	| z80_rra
-	| z80_rrc
-	| z80_rrca
-	| z80_rst
-	| z80_sbc
-	| z80_scf
-	| z80_set
-	| z80_sla
-	| z80_sra
-	| z80_srl
-	| z80_stop
-	| z80_sub
-	| z80_swap
-	| z80_xor
+datum:
+	  db
+	| dw
+	| dl
+	| ds
+	| sm83_adc
+	| sm83_add
+	| sm83_and
+	| sm83_bit
+	| sm83_call
+	| sm83_ccf
+	| sm83_cp
+	| sm83_cpl
+	| sm83_daa
+	| sm83_dec
+	| sm83_di
+	| sm83_ei
+	| sm83_halt
+	| sm83_inc
+	| sm83_jp
+	| sm83_jr
+	| sm83_ld
+	| sm83_ldd
+	| sm83_ldh
+	| sm83_ldi
+	| sm83_nop
+	| sm83_or
+	| sm83_pop
+	| sm83_push
+	| sm83_res
+	| sm83_ret
+	| sm83_reti
+	| sm83_rl
+	| sm83_rla
+	| sm83_rlc
+	| sm83_rlca
+	| sm83_rr
+	| sm83_rra
+	| sm83_rrc
+	| sm83_rrca
+	| sm83_rst
+	| sm83_sbc
+	| sm83_scf
+	| sm83_set
+	| sm83_sla
+	| sm83_sra
+	| sm83_srl
+	| sm83_stop
+	| sm83_sub
+	| sm83_swap
+	| sm83_xor
 ;
 
-z80_adc:
-	Z80_ADC op_a_n {
-		sect_AbsByte(0xCE);
+ds:
+	POP_DS uconst {
+		sect_Skip($2, true);
+	}
+	| POP_DS uconst COMMA ds_args trailing_comma {
+		sect_RelBytes($2, $4);
+	}
+	| POP_DS POP_ALIGN LBRACK align_spec RBRACK trailing_comma {
+		uint32_t n = sect_GetAlignBytes($4.alignment, $4.alignOfs);
+		sect_Skip(n, true);
+		sect_AlignPC($4.alignment, $4.alignOfs);
+	}
+	| POP_DS POP_ALIGN LBRACK align_spec RBRACK COMMA ds_args trailing_comma {
+		uint32_t n = sect_GetAlignBytes($4.alignment, $4.alignOfs);
+		sect_RelBytes(n, $7);
+		sect_AlignPC($4.alignment, $4.alignOfs);
+	}
+;
+
+ds_args:
+	reloc_8bit {
+		$$.push_back(std::move($1));
+	}
+	| ds_args COMMA reloc_8bit {
+		$$ = std::move($1);
+		$$.push_back(std::move($3));
+	}
+;
+
+db:
+	POP_DB {
+		sect_Skip(1, false);
+	}
+	| POP_DB constlist_8bit trailing_comma
+;
+
+dw:
+	POP_DW {
+		sect_Skip(2, false);
+	}
+	| POP_DW constlist_16bit trailing_comma
+;
+
+dl:
+	POP_DL {
+		sect_Skip(4, false);
+	}
+	| POP_DL constlist_32bit trailing_comma
+;
+
+sm83_adc:
+	SM83_ADC op_a_n {
+		sect_ConstByte(0xCE);
 		sect_RelByte($2, 1);
 	}
-	| Z80_ADC op_a_r {
-		sect_AbsByte(0x88 | $2);
+	| SM83_ADC op_a_r {
+		sect_ConstByte(0x88 | $2);
 	}
 ;
 
-z80_add:
-	Z80_ADD op_a_n {
-		sect_AbsByte(0xC6);
+sm83_add:
+	SM83_ADD op_a_n {
+		sect_ConstByte(0xC6);
 		sect_RelByte($2, 1);
 	}
-	| Z80_ADD op_a_r {
-		sect_AbsByte(0x80 | $2);
+	| SM83_ADD op_a_r {
+		sect_ConstByte(0x80 | $2);
 	}
-	| Z80_ADD MODE_HL COMMA reg_ss {
-		sect_AbsByte(0x09 | ($4 << 4));
+	| SM83_ADD MODE_HL COMMA reg_ss {
+		sect_ConstByte(0x09 | ($4 << 4));
 	}
-	| Z80_ADD MODE_SP COMMA reloc_8bit {
-		sect_AbsByte(0xE8);
+	| SM83_ADD MODE_SP COMMA reloc_8bit_signed {
+		sect_ConstByte(0xE8);
 		sect_RelByte($4, 1);
 	}
 ;
 
-z80_and:
-	Z80_AND op_a_n {
-		sect_AbsByte(0xE6);
+sm83_and:
+	SM83_AND op_a_n {
+		sect_ConstByte(0xE6);
 		sect_RelByte($2, 1);
 	}
-	| Z80_AND op_a_r {
-		sect_AbsByte(0xA0 | $2);
+	| SM83_AND op_a_r {
+		sect_ConstByte(0xA0 | $2);
 	}
 ;
 
-z80_bit:
-	Z80_BIT bit_const COMMA reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x40 | ($2 << 3) | $4);
+sm83_bit:
+	SM83_BIT reloc_3bit COMMA reg_r {
+		uint8_t mask = static_cast<uint8_t>(0x40 | $4);
+		$2.addCheckBitIndex(mask);
+		sect_ConstByte(0xCB);
+		if (!$2.isKnown()) {
+			sect_RelByte($2, 0);
+		} else {
+			sect_ConstByte(mask | ($2.value() << 3));
+		}
 	}
 ;
 
-z80_call:
-	Z80_CALL reloc_16bit {
-		sect_AbsByte(0xCD);
+sm83_call:
+	SM83_CALL reloc_16bit {
+		sect_ConstByte(0xCD);
 		sect_RelWord($2, 1);
 	}
-	| Z80_CALL ccode_expr COMMA reloc_16bit {
-		sect_AbsByte(0xC4 | ($2 << 3));
+	| SM83_CALL ccode_expr COMMA reloc_16bit {
+		sect_ConstByte(0xC4 | ($2 << 3));
 		sect_RelWord($4, 1);
 	}
 ;
 
-z80_ccf:
-	Z80_CCF {
-		sect_AbsByte(0x3F);
+sm83_ccf:
+	SM83_CCF {
+		sect_ConstByte(0x3F);
 	}
 ;
 
-z80_cp:
-	Z80_CP op_a_n {
-		sect_AbsByte(0xFE);
+sm83_cp:
+	SM83_CP op_a_n {
+		sect_ConstByte(0xFE);
 		sect_RelByte($2, 1);
 	}
-	| Z80_CP op_a_r {
-		sect_AbsByte(0xB8 | $2);
+	| SM83_CP op_a_r {
+		sect_ConstByte(0xB8 | $2);
 	}
 ;
 
-z80_cpl:
-	Z80_CPL {
-		sect_AbsByte(0x2F);
+sm83_cpl:
+	SM83_CPL {
+		sect_ConstByte(0x2F);
+	}
+	| SM83_CPL MODE_A {
+		sect_ConstByte(0x2F);
 	}
 ;
 
-z80_daa:
-	Z80_DAA {
-		sect_AbsByte(0x27);
+sm83_daa:
+	SM83_DAA {
+		sect_ConstByte(0x27);
 	}
 ;
 
-z80_dec:
-	Z80_DEC reg_r {
-		sect_AbsByte(0x05 | ($2 << 3));
+sm83_dec:
+	SM83_DEC reg_r {
+		sect_ConstByte(0x05 | ($2 << 3));
 	}
-	| Z80_DEC reg_ss {
-		sect_AbsByte(0x0B | ($2 << 4));
-	}
-;
-
-z80_di:
-	Z80_DI {
-		sect_AbsByte(0xF3);
+	| SM83_DEC reg_ss {
+		sect_ConstByte(0x0B | ($2 << 4));
 	}
 ;
 
-z80_ei:
-	Z80_EI {
-		sect_AbsByte(0xFB);
+sm83_di:
+	SM83_DI {
+		sect_ConstByte(0xF3);
 	}
 ;
 
-z80_halt:
-	Z80_HALT {
-		sect_AbsByte(0x76);
+sm83_ei:
+	SM83_EI {
+		sect_ConstByte(0xFB);
 	}
 ;
 
-z80_inc:
-	Z80_INC reg_r {
-		sect_AbsByte(0x04 | ($2 << 3));
-	}
-	| Z80_INC reg_ss {
-		sect_AbsByte(0x03 | ($2 << 4));
+sm83_halt:
+	SM83_HALT {
+		sect_ConstByte(0x76);
 	}
 ;
 
-z80_jp:
-	Z80_JP reloc_16bit {
-		sect_AbsByte(0xC3);
+sm83_inc:
+	SM83_INC reg_r {
+		sect_ConstByte(0x04 | ($2 << 3));
+	}
+	| SM83_INC reg_ss {
+		sect_ConstByte(0x03 | ($2 << 4));
+	}
+;
+
+sm83_jp:
+	SM83_JP reloc_16bit {
+		sect_ConstByte(0xC3);
 		sect_RelWord($2, 1);
 	}
-	| Z80_JP ccode_expr COMMA reloc_16bit {
-		sect_AbsByte(0xC2 | ($2 << 3));
+	| SM83_JP ccode_expr COMMA reloc_16bit {
+		sect_ConstByte(0xC2 | ($2 << 3));
 		sect_RelWord($4, 1);
 	}
-	| Z80_JP MODE_HL {
-		sect_AbsByte(0xE9);
+	| SM83_JP MODE_HL {
+		sect_ConstByte(0xE9);
 	}
 ;
 
-z80_jr:
-	Z80_JR reloc_16bit {
-		sect_AbsByte(0x18);
+sm83_jr:
+	SM83_JR reloc_16bit {
+		sect_ConstByte(0x18);
 		sect_PCRelByte($2, 1);
 	}
-	| Z80_JR ccode_expr COMMA reloc_16bit {
-		sect_AbsByte(0x20 | ($2 << 3));
+	| SM83_JR ccode_expr COMMA reloc_16bit {
+		sect_ConstByte(0x20 | ($2 << 3));
 		sect_PCRelByte($4, 1);
 	}
 ;
 
-z80_ldi:
-	Z80_LDI LBRACK MODE_HL RBRACK COMMA MODE_A {
-		sect_AbsByte(0x02 | (2 << 4));
+sm83_ldi:
+	SM83_LDI LBRACK MODE_HL RBRACK COMMA MODE_A {
+		sect_ConstByte(0x02 | (2 << 4));
 	}
-	| Z80_LDI MODE_A COMMA LBRACK MODE_HL RBRACK {
-		sect_AbsByte(0x0A | (2 << 4));
-	}
-;
-
-z80_ldd:
-	Z80_LDD LBRACK MODE_HL RBRACK COMMA MODE_A {
-		sect_AbsByte(0x02 | (3 << 4));
-	}
-	| Z80_LDD MODE_A COMMA LBRACK MODE_HL RBRACK {
-		sect_AbsByte(0x0A | (3 << 4));
+	| SM83_LDI MODE_A COMMA LBRACK MODE_HL RBRACK {
+		sect_ConstByte(0x0A | (2 << 4));
 	}
 ;
 
-z80_ldio:
-	Z80_LDH MODE_A COMMA op_mem_ind {
-		$4.makeCheckHRAM();
-
-		sect_AbsByte(0xF0);
-		sect_RelByte($4, 1);
+sm83_ldd:
+	SM83_LDD LBRACK MODE_HL RBRACK COMMA MODE_A {
+		sect_ConstByte(0x02 | (3 << 4));
 	}
-	| Z80_LDH op_mem_ind COMMA MODE_A {
-		$2.makeCheckHRAM();
-
-		sect_AbsByte(0xE0);
-		sect_RelByte($2, 1);
-	}
-	| Z80_LDH MODE_A COMMA c_ind {
-		sect_AbsByte(0xF2);
-	}
-	| Z80_LDH c_ind COMMA MODE_A {
-		sect_AbsByte(0xE2);
+	| SM83_LDD MODE_A COMMA LBRACK MODE_HL RBRACK {
+		sect_ConstByte(0x0A | (3 << 4));
 	}
 ;
 
-c_ind:
-	  LBRACK MODE_C RBRACK
-	| LBRACK relocexpr OP_ADD MODE_C RBRACK {
-		// This has to use `relocexpr`, not `const`, to avoid a shift/reduce conflict
-		if ($2.getConstVal() != 0xFF00)
-			::error("Base value must be equal to $FF00 for $FF00+C\n");
+sm83_ldh:
+	SM83_LDH MODE_A COMMA op_mem_ind {
+		$4.addCheckHRAM();
+		sect_ConstByte(0xF0);
+		if (!$4.isKnown()) {
+			sect_RelByte($4, 1);
+		} else {
+			sect_ConstByte($4.value());
+		}
+	}
+	| SM83_LDH op_mem_ind COMMA MODE_A {
+		$2.addCheckHRAM();
+		sect_ConstByte(0xE0);
+		if (!$2.isKnown()) {
+			sect_RelByte($2, 1);
+		} else {
+			sect_ConstByte($2.value());
+		}
+	}
+	| SM83_LDH MODE_A COMMA c_ind {
+		sect_ConstByte(0xF2);
+	}
+	| SM83_LDH MODE_A COMMA ff00_c_ind {
+		sect_ConstByte(0xF2);
+	}
+	| SM83_LDH c_ind COMMA MODE_A {
+		sect_ConstByte(0xE2);
+	}
+	| SM83_LDH ff00_c_ind COMMA MODE_A {
+		sect_ConstByte(0xE2);
 	}
 ;
 
-z80_ld:
-	  z80_ld_mem
-	| z80_ld_c_ind
-	| z80_ld_rr
-	| z80_ld_ss
-	| z80_ld_hl
-	| z80_ld_sp
-	| z80_ld_r_no_a
-	| z80_ld_a
+c_ind: LBRACK MODE_C RBRACK;
+
+ff00_c_ind:
+	LBRACK relocexpr OP_ADD MODE_C RBRACK {
+		// This has to use `relocexpr`, not `iconst`, to avoid a shift/reduce conflict
+		if ($2.getConstVal() != 0xFF00) {
+			::error("Base value must be equal to $FF00 for [$FF00+C]");
+		}
+	}
 ;
 
-z80_ld_hl:
-	Z80_LD MODE_HL COMMA MODE_SP reloc_8bit_offset {
-		sect_AbsByte(0xF8);
+sm83_ld:
+	  sm83_ld_mem
+	| sm83_ld_c_ind
+	| sm83_ld_rr
+	| sm83_ld_ss
+	| sm83_ld_hl
+	| sm83_ld_sp
+	| sm83_ld_r_no_a
+	| sm83_ld_a
+;
+
+sm83_ld_hl:
+	SM83_LD MODE_HL COMMA MODE_SP op_sp_offset {
+		sect_ConstByte(0xF8);
 		sect_RelByte($5, 1);
 	}
-	| Z80_LD MODE_HL COMMA reloc_16bit {
-		sect_AbsByte(0x01 | (REG_HL << 4));
+	| SM83_LD MODE_HL COMMA reloc_16bit {
+		sect_ConstByte(0x01 | (REG_HL << 4));
+		sect_RelWord($4, 1);
+	}
+	| SM83_LD MODE_HL COMMA reg_tt_no_af {
+		::error(
+		    "\"LD HL, %s\" is not a valid instruction; use \"LD H, %s\" and \"LD L, %s\"",
+		    reg_tt_names[$4],
+		    reg_tt_high_names[$4],
+		    reg_tt_low_names[$4]
+		);
+	}
+;
+
+sm83_ld_sp:
+	SM83_LD MODE_SP COMMA MODE_HL {
+		sect_ConstByte(0xF9);
+	}
+	| SM83_LD MODE_SP COMMA reg_bc_or_de {
+		::error("\"LD SP, %s\" is not a valid instruction", reg_tt_names[$4]);
+	}
+	| SM83_LD MODE_SP COMMA reloc_16bit {
+		sect_ConstByte(0x01 | (REG_SP << 4));
 		sect_RelWord($4, 1);
 	}
 ;
 
-z80_ld_sp:
-	Z80_LD MODE_SP COMMA MODE_HL {
-		sect_AbsByte(0xF9);
-	}
-	| Z80_LD MODE_SP COMMA reloc_16bit {
-		sect_AbsByte(0x01 | (REG_SP << 4));
-		sect_RelWord($4, 1);
-	}
-;
-
-z80_ld_mem:
-	Z80_LD op_mem_ind COMMA MODE_SP {
-		sect_AbsByte(0x08);
+sm83_ld_mem:
+	SM83_LD op_mem_ind COMMA MODE_SP {
+		sect_ConstByte(0x08);
 		sect_RelWord($2, 1);
 	}
-	| Z80_LD op_mem_ind COMMA MODE_A {
-		sect_AbsByte(0xEA);
+	| SM83_LD op_mem_ind COMMA MODE_A {
+		sect_ConstByte(0xEA);
 		sect_RelWord($2, 1);
 	}
 ;
 
-z80_ld_c_ind:
-	Z80_LD c_ind COMMA MODE_A {
-		sect_AbsByte(0xE2);
+sm83_ld_c_ind:
+	SM83_LD ff00_c_ind COMMA MODE_A {
+		sect_ConstByte(0xE2);
 	}
 ;
 
-z80_ld_rr:
-	Z80_LD reg_rr COMMA MODE_A {
-		sect_AbsByte(0x02 | ($2 << 4));
+sm83_ld_rr:
+	SM83_LD reg_rr COMMA MODE_A {
+		sect_ConstByte(0x02 | ($2 << 4));
 	}
 ;
 
-z80_ld_r_no_a:
-	Z80_LD reg_r_no_a COMMA reloc_8bit {
-		sect_AbsByte(0x06 | ($2 << 3));
+sm83_ld_r_no_a:
+	SM83_LD reg_r_no_a COMMA reloc_8bit {
+		sect_ConstByte(0x06 | ($2 << 3));
 		sect_RelByte($4, 1);
 	}
-	| Z80_LD reg_r_no_a COMMA reg_r {
-		if ($2 == REG_HL_IND && $4 == REG_HL_IND)
-			::error("LD [HL], [HL] is not a valid instruction\n");
-		else
-			sect_AbsByte(0x40 | ($2 << 3) | $4);
+	| SM83_LD reg_r_no_a COMMA reg_r {
+		if ($2 == REG_HL_IND && $4 == REG_HL_IND) {
+			::error("\"LD [HL], [HL]\" is not a valid instruction");
+		} else {
+			sect_ConstByte(0x40 | ($2 << 3) | $4);
+		}
 	}
 ;
 
-z80_ld_a:
-	Z80_LD reg_a COMMA reloc_8bit {
-		sect_AbsByte(0x06 | ($2 << 3));
+sm83_ld_a:
+	SM83_LD reg_a COMMA reloc_8bit {
+		sect_ConstByte(0x06 | ($2 << 3));
 		sect_RelByte($4, 1);
 	}
-	| Z80_LD reg_a COMMA reg_r {
-		sect_AbsByte(0x40 | ($2 << 3) | $4);
+	| SM83_LD reg_a COMMA reg_r {
+		sect_ConstByte(0x40 | ($2 << 3) | $4);
 	}
-	| Z80_LD reg_a COMMA c_ind {
-		sect_AbsByte(0xF2);
+	| SM83_LD reg_a COMMA ff00_c_ind {
+		sect_ConstByte(0xF2);
 	}
-	| Z80_LD reg_a COMMA reg_rr {
-		sect_AbsByte(0x0A | ($4 << 4));
+	| SM83_LD reg_a COMMA reg_rr {
+		sect_ConstByte(0x0A | ($4 << 4));
 	}
-	| Z80_LD reg_a COMMA op_mem_ind {
-		sect_AbsByte(0xFA);
+	| SM83_LD reg_a COMMA op_mem_ind {
+		sect_ConstByte(0xFA);
 		sect_RelWord($4, 1);
 	}
 ;
 
-z80_ld_ss:
-	Z80_LD MODE_BC COMMA reloc_16bit {
-		sect_AbsByte(0x01 | (REG_BC << 4));
+sm83_ld_ss:
+	SM83_LD reg_bc_or_de COMMA reloc_16bit {
+		sect_ConstByte(0x01 | ($2 << 4));
 		sect_RelWord($4, 1);
 	}
-	| Z80_LD MODE_DE COMMA reloc_16bit {
-		sect_AbsByte(0x01 | (REG_DE << 4));
-		sect_RelWord($4, 1);
+	| SM83_LD reg_bc_or_de COMMA reg_tt_no_af {
+		::error(
+		    "\"LD %s, %s\" is not a valid instruction; use \"LD %s, %s\" and \"LD %s, %s\"",
+		    reg_tt_names[$2],
+		    reg_tt_names[$4],
+		    reg_tt_high_names[$2],
+		    reg_tt_high_names[$4],
+		    reg_tt_low_names[$2],
+		    reg_tt_low_names[$4]
+		);
 	}
-	// HL is taken care of in z80_ld_hl
-	// SP is taken care of in z80_ld_sp
+	// HL is taken care of in sm83_ld_hl
+	// SP is taken care of in sm83_ld_sp
 ;
 
-z80_nop:
-	Z80_NOP {
-		sect_AbsByte(0x00);
+sm83_nop:
+	SM83_NOP {
+		sect_ConstByte(0x00);
 	}
 ;
 
-z80_or:
-	Z80_OR op_a_n {
-		sect_AbsByte(0xF6);
+sm83_or:
+	SM83_OR op_a_n {
+		sect_ConstByte(0xF6);
 		sect_RelByte($2, 1);
 	}
-	| Z80_OR op_a_r {
-		sect_AbsByte(0xB0 | $2);
+	| SM83_OR op_a_r {
+		sect_ConstByte(0xB0 | $2);
 	}
 ;
 
-z80_pop:
-	Z80_POP reg_tt {
-		sect_AbsByte(0xC1 | ($2 << 4));
+sm83_pop:
+	SM83_POP reg_tt {
+		sect_ConstByte(0xC1 | ($2 << 4));
 	}
 ;
 
-z80_push:
-	Z80_PUSH reg_tt {
-		sect_AbsByte(0xC5 | ($2 << 4));
+sm83_push:
+	SM83_PUSH reg_tt {
+		sect_ConstByte(0xC5 | ($2 << 4));
 	}
 ;
 
-z80_res:
-	Z80_RES bit_const COMMA reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x80 | ($2 << 3) | $4);
-	}
-;
-
-z80_ret:
-	Z80_RET {
-		sect_AbsByte(0xC9);
-	}
-	| Z80_RET ccode_expr {
-		sect_AbsByte(0xC0 | ($2 << 3));
-	}
-;
-
-z80_reti:
-	Z80_RETI {
-		sect_AbsByte(0xD9);
-	}
-;
-
-z80_rl:
-	Z80_RL reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x10 | $2);
-	}
-;
-
-z80_rla:
-	Z80_RLA {
-		sect_AbsByte(0x17);
-	}
-;
-
-z80_rlc:
-	Z80_RLC reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x00 | $2);
-	}
-;
-
-z80_rlca:
-	Z80_RLCA {
-		sect_AbsByte(0x07);
-	}
-;
-
-z80_rr:
-	Z80_RR reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x18 | $2);
-	}
-;
-
-z80_rra:
-	Z80_RRA {
-		sect_AbsByte(0x1F);
-	}
-;
-
-z80_rrc:
-	Z80_RRC reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x08 | $2);
-	}
-;
-
-z80_rrca:
-	Z80_RRCA {
-		sect_AbsByte(0x0F);
-	}
-;
-
-z80_rst:
-	Z80_RST reloc_8bit {
-		$2.makeCheckRST();
-		if (!$2.isKnown())
+sm83_res:
+	SM83_RES reloc_3bit COMMA reg_r {
+		uint8_t mask = static_cast<uint8_t>(0x80 | $4);
+		$2.addCheckBitIndex(mask);
+		sect_ConstByte(0xCB);
+		if (!$2.isKnown()) {
 			sect_RelByte($2, 0);
-		else
-			sect_AbsByte(0xC7 | $2.value());
+		} else {
+			sect_ConstByte(mask | ($2.value() << 3));
+		}
 	}
 ;
 
-z80_sbc:
-	Z80_SBC op_a_n {
-		sect_AbsByte(0xDE);
+sm83_ret:
+	SM83_RET {
+		sect_ConstByte(0xC9);
+	}
+	| SM83_RET ccode_expr {
+		sect_ConstByte(0xC0 | ($2 << 3));
+	}
+;
+
+sm83_reti:
+	SM83_RETI {
+		sect_ConstByte(0xD9);
+	}
+;
+
+sm83_rl:
+	SM83_RL reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x10 | $2);
+	}
+;
+
+sm83_rla:
+	SM83_RLA {
+		sect_ConstByte(0x17);
+	}
+;
+
+sm83_rlc:
+	SM83_RLC reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x00 | $2);
+	}
+;
+
+sm83_rlca:
+	SM83_RLCA {
+		sect_ConstByte(0x07);
+	}
+;
+
+sm83_rr:
+	SM83_RR reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x18 | $2);
+	}
+;
+
+sm83_rra:
+	SM83_RRA {
+		sect_ConstByte(0x1F);
+	}
+;
+
+sm83_rrc:
+	SM83_RRC reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x08 | $2);
+	}
+;
+
+sm83_rrca:
+	SM83_RRCA {
+		sect_ConstByte(0x0F);
+	}
+;
+
+sm83_rst:
+	SM83_RST reloc_8bit {
+		$2.addCheckRST();
+		if (!$2.isKnown()) {
+			sect_RelByte($2, 0);
+		} else {
+			sect_ConstByte(0xC7 | $2.value());
+		}
+	}
+;
+
+sm83_sbc:
+	SM83_SBC op_a_n {
+		sect_ConstByte(0xDE);
 		sect_RelByte($2, 1);
 	}
-	| Z80_SBC op_a_r {
-		sect_AbsByte(0x98 | $2);
+	| SM83_SBC op_a_r {
+		sect_ConstByte(0x98 | $2);
 	}
 ;
 
-z80_scf:
-	Z80_SCF {
-		sect_AbsByte(0x37);
+sm83_scf:
+	SM83_SCF {
+		sect_ConstByte(0x37);
 	}
 ;
 
-z80_set:
-	Z80_SET bit_const COMMA reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0xC0 | ($2 << 3) | $4);
+sm83_set:
+	SM83_SET reloc_3bit COMMA reg_r {
+		uint8_t mask = static_cast<uint8_t>(0xC0 | $4);
+		$2.addCheckBitIndex(mask);
+		sect_ConstByte(0xCB);
+		if (!$2.isKnown()) {
+			sect_RelByte($2, 0);
+		} else {
+			sect_ConstByte(mask | ($2.value() << 3));
+		}
 	}
 ;
 
-z80_sla:
-	Z80_SLA reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x20 | $2);
+sm83_sla:
+	SM83_SLA reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x20 | $2);
 	}
 ;
 
-z80_sra:
-	Z80_SRA reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x28 | $2);
+sm83_sra:
+	SM83_SRA reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x28 | $2);
 	}
 ;
 
-z80_srl:
-	Z80_SRL reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x38 | $2);
+sm83_srl:
+	SM83_SRL reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x38 | $2);
 	}
 ;
 
-z80_stop:
-	Z80_STOP {
-		sect_AbsByte(0x10);
-		sect_AbsByte(0x00);
+sm83_stop:
+	SM83_STOP {
+		sect_ConstByte(0x10);
+		sect_ConstByte(0x00);
 	}
-	| Z80_STOP reloc_8bit {
-		sect_AbsByte(0x10);
+	| SM83_STOP reloc_8bit {
+		sect_ConstByte(0x10);
 		sect_RelByte($2, 1);
 	}
 ;
 
-z80_sub:
-	Z80_SUB op_a_n {
-		sect_AbsByte(0xD6);
+sm83_sub:
+	SM83_SUB op_a_n {
+		sect_ConstByte(0xD6);
 		sect_RelByte($2, 1);
 	}
-	| Z80_SUB op_a_r {
-		sect_AbsByte(0x90 | $2);
+	| SM83_SUB op_a_r {
+		sect_ConstByte(0x90 | $2);
 	}
 ;
 
-z80_swap:
-	Z80_SWAP reg_r {
-		sect_AbsByte(0xCB);
-		sect_AbsByte(0x30 | $2);
+sm83_swap:
+	SM83_SWAP reg_r {
+		sect_ConstByte(0xCB);
+		sect_ConstByte(0x30 | $2);
 	}
 ;
 
-z80_xor:
-	Z80_XOR op_a_n {
-		sect_AbsByte(0xEE);
+sm83_xor:
+	SM83_XOR op_a_n {
+		sect_ConstByte(0xEE);
 		sect_RelByte($2, 1);
 	}
-	| Z80_XOR op_a_r {
-		sect_AbsByte(0xA8 | $2);
+	| SM83_XOR op_a_r {
+		sect_ConstByte(0xA8 | $2);
 	}
 ;
 
@@ -2220,7 +2439,44 @@ op_a_n:
 	}
 ;
 
+op_sp_offset:
+	OP_ADD relocexpr {
+		$$ = std::move($2);
+		$$.checkSignedNBit(8);
+	}
+	| OP_SUB relocexpr {
+		$$.makeUnaryOp(RPN_NEG, std::move($2));
+		$$.checkSignedNBit(8);
+	}
+	| %empty {
+		::error("\"LD HL, SP\" is not a valid instruction; use \"LD HL, SP + 0\"");
+	}
+;
+
 // Registers and condition codes.
+
+MODE_R8:
+	  MODE_A
+	| MODE_B
+	| MODE_C
+	| MODE_D
+	| MODE_E
+	| MODE_H
+	| MODE_L
+	| LBRACK MODE_BC RBRACK
+	| LBRACK MODE_DE RBRACK
+	| LBRACK MODE_HL RBRACK
+	| hl_ind_inc
+	| hl_ind_dec
+;
+
+MODE_R16:
+	  MODE_AF
+	| MODE_BC
+	| MODE_DE
+	| MODE_HL
+	| MODE_SP
+;
 
 MODE_A:
 	  TOKEN_A
@@ -2312,32 +2568,32 @@ reg_a:
 ;
 
 reg_tt:
-	MODE_BC {
-		$$ = REG_BC;
-	}
-	| MODE_DE {
-		$$ = REG_DE;
-	}
-	| MODE_HL {
-		$$ = REG_HL;
-	}
+	reg_tt_no_af
 	| MODE_AF {
 		$$ = REG_AF;
 	}
 ;
 
 reg_ss:
+	reg_tt_no_af
+	| MODE_SP {
+		$$ = REG_SP;
+	}
+;
+
+reg_tt_no_af:
+	reg_bc_or_de
+	| MODE_HL {
+		$$ = REG_HL;
+	}
+;
+
+reg_bc_or_de:
 	MODE_BC {
 		$$ = REG_BC;
 	}
 	| MODE_DE {
 		$$ = REG_DE;
-	}
-	| MODE_HL {
-		$$ = REG_HL;
-	}
-	| MODE_SP {
-		$$ = REG_SP;
 	}
 ;
 
@@ -2368,286 +2624,8 @@ hl_ind_dec:
 
 %%
 
-// Semantic actions.
+/******************** Error handler ********************/
 
 void yy::parser::error(std::string const &str) {
-	::error("%s\n", str.c_str());
-}
-
-static uint32_t str2int2(std::vector<uint8_t> const &s) {
-	uint32_t length = s.size();
-
-	if (length > 4)
-		warning(
-		    WARNING_NUMERIC_STRING_1,
-		    "Treating string as a number ignores first %" PRIu32 " character%s\n",
-		    length - 4,
-		    length == 5 ? "" : "s"
-		);
-	else if (length > 1)
-		warning(
-		    WARNING_NUMERIC_STRING_2, "Treating %" PRIu32 "-character string as a number\n", length
-		);
-
-	uint32_t r = 0;
-
-	for (uint32_t i = length < 4 ? 0 : length - 4; i < length; i++) {
-		r <<= 8;
-		r |= s[i];
-	}
-
-	return r;
-}
-
-static void errorInvalidUTF8Byte(uint8_t byte, char const *functionName) {
-	error("%s: Invalid UTF-8 byte 0x%02hhX\n", functionName, byte);
-}
-
-static size_t strlenUTF8(std::string const &str) {
-	char const *ptr = str.c_str();
-	size_t len = 0;
-	uint32_t state = 0;
-
-	for (uint32_t codep = 0; *ptr; ptr++) {
-		uint8_t byte = *ptr;
-
-		switch (decode(&state, &codep, byte)) {
-		case 1:
-			errorInvalidUTF8Byte(byte, "STRLEN");
-			state = 0;
-			// fallthrough
-		case 0:
-			len++;
-			break;
-		}
-	}
-
-	// Check for partial code point.
-	if (state != 0)
-		error("STRLEN: Incomplete UTF-8 character\n");
-
-	return len;
-}
-
-static std::string strsubUTF8(std::string const &str, uint32_t pos, uint32_t len) {
-	char const *ptr = str.c_str();
-	size_t index = 0;
-	uint32_t state = 0;
-	uint32_t codep = 0;
-	uint32_t curPos = 1; // RGBASM strings are 1-indexed!
-
-	// Advance to starting position in source string.
-	while (ptr[index] && curPos < pos) {
-		switch (decode(&state, &codep, ptr[index])) {
-		case 1:
-			errorInvalidUTF8Byte(ptr[index], "STRSUB");
-			state = 0;
-			// fallthrough
-		case 0:
-			curPos++;
-			break;
-		}
-		index++;
-	}
-
-	// A position 1 past the end of the string is allowed, but will trigger the
-	// "Length too big" warning below if the length is nonzero.
-	if (!ptr[index] && pos > curPos)
-		warning(
-		    WARNING_BUILTIN_ARG, "STRSUB: Position %" PRIu32 " is past the end of the string\n", pos
-		);
-
-	size_t startIndex = index;
-	uint32_t curLen = 0;
-
-	// Compute the result length in bytes.
-	while (ptr[index] && curLen < len) {
-		switch (decode(&state, &codep, ptr[index])) {
-		case 1:
-			errorInvalidUTF8Byte(ptr[index], "STRSUB");
-			state = 0;
-			// fallthrough
-		case 0:
-			curLen++;
-			break;
-		}
-		index++;
-	}
-
-	if (curLen < len)
-		warning(WARNING_BUILTIN_ARG, "STRSUB: Length too big: %" PRIu32 "\n", len);
-
-	// Check for partial code point.
-	if (state != 0)
-		error("STRSUB: Incomplete UTF-8 character\n");
-
-	return std::string(ptr + startIndex, ptr + index);
-}
-
-static size_t charlenUTF8(std::string const &str) {
-	std::string_view view = str;
-	size_t len;
-
-	for (len = 0; charmap_ConvertNext(view, nullptr); len++)
-		;
-
-	return len;
-}
-
-static std::string charsubUTF8(std::string const &str, uint32_t pos) {
-	std::string_view view = str;
-	size_t charLen = 1;
-
-	// Advance to starting position in source string.
-	for (uint32_t curPos = 1; charLen && curPos < pos; curPos++)
-		charLen = charmap_ConvertNext(view, nullptr);
-
-	std::string_view start = view;
-
-	if (!charmap_ConvertNext(view, nullptr))
-		warning(
-		    WARNING_BUILTIN_ARG,
-		    "CHARSUB: Position %" PRIu32 " is past the end of the string\n",
-		    pos
-		);
-
-	start = start.substr(0, start.length() - view.length());
-	return std::string(start);
-}
-
-static uint32_t adjustNegativePos(int32_t pos, size_t len, char const *functionName) {
-	// STRSUB and CHARSUB adjust negative `pos` arguments the same way,
-	// such that position -1 is the last character of a string.
-	if (pos < 0)
-		pos += len + 1;
-	if (pos < 1) {
-		warning(WARNING_BUILTIN_ARG, "%s: Position starts at 1\n", functionName);
-		pos = 1;
-	}
-	return (uint32_t)pos;
-}
-
-static std::string strrpl(std::string_view str, std::string const &old, std::string const &rep) {
-	if (old.empty()) {
-		warning(WARNING_EMPTY_STRRPL, "STRRPL: Cannot replace an empty string\n");
-		return std::string(str);
-	}
-
-	std::string rpl;
-
-	while (!str.empty()) {
-		auto pos = str.find(old);
-		if (pos == str.npos) {
-			rpl.append(str);
-			break;
-		}
-		rpl.append(str, 0, pos);
-		rpl.append(rep);
-		str.remove_prefix(pos + old.size());
-	}
-
-	return rpl;
-}
-
-static std::string strfmt(
-    std::string const &spec,
-    std::vector<std::variant<uint32_t, std::string>> const &args
-) {
-	std::string str;
-	size_t argIndex = 0;
-
-	for (size_t i = 0; spec[i] != '\0'; ++i) {
-		int c = spec[i];
-
-		if (c != '%') {
-			str += c;
-			continue;
-		}
-
-		c = spec[++i];
-
-		if (c == '%') {
-			str += c;
-			continue;
-		}
-
-		FormatSpec fmt{};
-
-		while (c != '\0') {
-			fmt.useCharacter(c);
-			if (fmt.isFinished())
-				break;
-			c = spec[++i];
-		}
-
-		if (fmt.isEmpty()) {
-			error("STRFMT: Illegal '%%' at end of format string\n");
-			str += '%';
-			break;
-		}
-
-		if (!fmt.isValid()) {
-			error("STRFMT: Invalid format spec for argument %zu\n", argIndex + 1);
-			str += '%';
-		} else if (argIndex >= args.size()) {
-			// Will warn after formatting is done.
-			str += '%';
-		} else if (auto *n = std::get_if<uint32_t>(&args[argIndex]); n) {
-			fmt.appendNumber(str, *n);
-		} else {
-			assume(std::holds_alternative<std::string>(args[argIndex]));
-			auto &s = std::get<std::string>(args[argIndex]);
-			fmt.appendString(str, s);
-		}
-
-		argIndex++;
-	}
-
-	if (argIndex < args.size())
-		error("STRFMT: %zu unformatted argument(s)\n", args.size() - argIndex);
-	else if (argIndex > args.size())
-		error(
-		    "STRFMT: Not enough arguments for format spec, got: %zu, need: %zu\n",
-		    args.size(),
-		    argIndex
-		);
-
-	return str;
-}
-
-static void compoundAssignment(std::string const &symName, RPNCommand op, int32_t constValue) {
-	Expression oldExpr, constExpr, newExpr;
-	int32_t newValue;
-
-	oldExpr.makeSymbol(symName);
-	constExpr.makeNumber(constValue);
-	newExpr.makeBinaryOp(op, std::move(oldExpr), constExpr);
-	newValue = newExpr.getConstVal();
-	sym_AddVar(symName, newValue);
-}
-
-static void failAssert(AssertionType type) {
-	switch (type) {
-	case ASSERT_FATAL:
-		fatalerror("Assertion failed\n");
-	case ASSERT_ERROR:
-		error("Assertion failed\n");
-		break;
-	case ASSERT_WARN:
-		warning(WARNING_ASSERT, "Assertion failed\n");
-		break;
-	}
-}
-
-static void failAssertMsg(AssertionType type, std::string const &message) {
-	switch (type) {
-	case ASSERT_FATAL:
-		fatalerror("Assertion failed: %s\n", message.c_str());
-	case ASSERT_ERROR:
-		error("Assertion failed: %s\n", message.c_str());
-		break;
-	case ASSERT_WARN:
-		warning(WARNING_ASSERT, "Assertion failed: %s\n", message.c_str());
-		break;
-	}
+	::error("%s", str.c_str());
 }
